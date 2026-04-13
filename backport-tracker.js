@@ -213,39 +213,32 @@
             tooltipParts.push('No CI checks yet');
         }
 
-        const API_OPTS = { headers: { 'Accept': 'application/vnd.github+json' }, credentials: 'include' };
-
-        // ── Label check via GitHub REST API ────────────────────────────────
+        // ── Label check via PR page HTML ───────────────────────────────────
         if (cfg.requiredLabels.length > 0 && result.ciStatus !== 'test_fail') {
-            try {
-                const resp = await fetch(`https://api.github.com/repos/${repo}/issues/${prNumber}/labels`, API_OPTS);
-                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-                const labels = await resp.json();
-                const presentNames = labels.map(l => l.name.toLowerCase());
-                const presentCount = cfg.requiredLabels.filter(req =>
-                    presentNames.some(n => n.includes(req.toLowerCase()))).length;
-                if (presentCount < cfg.requiredLabels.length) result.ciStatus = 'mgr_pending';
-                condParts.push(`${presentCount}/${cfg.requiredLabels.length} required label(s)`);
-            } catch(e) {
-                condParts.push(`labels: ${e.message}`);
-            }
+            const labelEls = doc.querySelectorAll(
+                'a.IssueLabel, .hx_IssueLabel, ' +
+                '[data-testid="labels-section-list"] a, ' +
+                '[data-testid="label-list-item"], ' +
+                '.js-issue-labels .IssueLabel'
+            );
+            const presentNames = Array.from(new Set(
+                Array.from(labelEls).map(el => el.textContent.trim().toLowerCase()).filter(Boolean)
+            ));
+            const presentCount = cfg.requiredLabels.filter(req =>
+                presentNames.some(n => n.includes(req.toLowerCase()))).length;
+            if (presentCount < cfg.requiredLabels.length) result.ciStatus = 'mgr_pending';
+            condParts.push(`${presentCount}/${cfg.requiredLabels.length} required label(s)`);
         }
 
-        // ── Reviewer approvals via GitHub REST API ─────────────────────────
+        // ── Reviewer approvals via PR page HTML ────────────────────────────
         if (cfg.requiredReviews > 0 && result.ciStatus !== 'test_fail') {
-            try {
-                const resp = await fetch(`https://api.github.com/repos/${repo}/pulls/${prNumber}/reviews`, API_OPTS);
-                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-                const reviews = await resp.json();
-                // Latest state per reviewer (users can re-review)
-                const latestByUser = {};
-                reviews.forEach(r => { if (r.user?.login) latestByUser[r.user.login] = r.state; });
-                const approvedCount = Object.values(latestByUser).filter(s => s === 'APPROVED').length;
-                if (approvedCount < cfg.requiredReviews) result.ciStatus = 'mgr_pending';
-                condParts.push(`${approvedCount}/${cfg.requiredReviews} required approval(s)`);
-            } catch(e) {
-                condParts.push(`reviews: ${e.message}`);
-            }
+            const approvedCount = doc.querySelectorAll(
+                '#partial-pull-reviewer-section .reviewers-status-icon .octicon-check, ' +
+                '[data-testid="reviewers-section"] .octicon-check.color-fg-success, ' +
+                '.js-reviewers-container .octicon-check'
+            ).length;
+            if (approvedCount < cfg.requiredReviews) result.ciStatus = 'mgr_pending';
+            condParts.push(`${approvedCount}/${cfg.requiredReviews} required approval(s)`);
         }
 
         if (condParts.length) tooltipParts.push(condParts.join(' '));
