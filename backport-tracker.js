@@ -69,11 +69,37 @@
     function getPrContext() {
         let baseBranchEl = document.querySelector('[data-testid="base-ref-name"], .base-ref, .commit-ref[title^="Base:"]');
         if (!baseBranchEl) {
+            // Scoped to the PR header to avoid picking up commit-refs in comments
+            const refs = document.querySelectorAll(
+                '#partial-discussion-header .commit-ref, ' +
+                '.gh-header-meta .commit-ref, ' +
+                '.js-issue-header-lockdown-section .commit-ref'
+            );
+            if (refs.length > 0) baseBranchEl = refs[0];
+        }
+        if (!baseBranchEl) {
+            // Broad fallback: first .commit-ref on the page
             const refs = document.querySelectorAll('.commit-ref');
             if (refs.length > 0) baseBranchEl = refs[0];
         }
-        if (!baseBranchEl) return null;
-        let branchName = baseBranchEl.textContent.trim().replace(/^Base:\s*/i, '');
+
+        let branchName = baseBranchEl ? baseBranchEl.textContent.trim().replace(/^Base:\s*/i, '') : null;
+
+        // Last resort: extract baseRefName from embedded JSON relay store
+        if (!branchName) {
+            const prNum = parseGithubUrl(window.location.href)?.prNumber;
+            if (prNum) {
+                for (const script of document.querySelectorAll('script[type="application/json"]')) {
+                    try {
+                        const text = script.textContent;
+                        if (!text.includes(prNum)) continue;
+                        const m = text.match(/"baseRefName"\s*:\s*"([^"]+)"/);
+                        if (m) { branchName = m[1]; break; }
+                    } catch {}
+                }
+            }
+        }
+
         if (!branchName) return null;
         return { isBackport: branchName !== 'master' && branchName !== 'main', baseBranch: branchName };
     }
@@ -335,7 +361,11 @@
         }
 
         const currentRepoData = parseGithubUrl(window.location.href);
-        if (!currentRepoData || !prContext) return;
+        if (!currentRepoData || !prContext) {
+            const root = document.getElementById('backport-ui-root');
+            if (root) root.innerHTML = `<div class="color-fg-muted f6">Could not read PR base branch.</div>`;
+            return;
+        }
 
         const root = document.getElementById('backport-ui-root');
         const comments = document.querySelectorAll('.comment-body, [data-testid="markdown-body"]');
