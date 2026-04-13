@@ -29,11 +29,21 @@ Injects a **Backports** panel into the PR sidebar that automatically finds and t
 
 - **Refresh button** — manually re-polls all non-completed PRs.
 - **⚙ Settings button** — opens a per-repo config panel (saved to `localStorage`):
-  - **Approval CI job** — substring match against CI check names; that check is separated from test results and tracked as an approval gate.
+  - **Ignore CI job** — substring match against CI check names; matching checks will be excluded from status tracking.
   - **Required label** — label name substring that must be present on the PR.
   - **Required review approvals** — minimum number of approved reviews required.
   - All three fields are optional and independent; set only what your repo uses.
-- **Copy summary** — copies a plain-text status summary to the clipboard (e.g. `[MERGED] release-1.2: https://...`).
+- **Copy summary** — copies a plain-text status summary to the clipboard. Each line follows the format:
+  ```
+  [STATUS] branch-name: https://github.com/owner/repo/pull/123
+  ```
+  If **Ignore CI job** is configured, a machine-readable header is prepended so `gh-rerunner` can pick it up automatically:
+  ```
+  # gh-rerunner: ignore_ci=lint,build-docs
+  [MERGED]   next/3.10.x: https://github.com/owner/repo/pull/100
+  [FETCHING] next/3.11.x: https://github.com/owner/repo/pull/101
+  [FAILURE]  next/3.12.x: https://github.com/owner/repo/pull/102
+  ```
 - **Auto-refresh** — statuses are refreshed automatically every 30 seconds.
 
 **Tooltip** (hover any row) shows a breakdown: `CI: N passed, N failed, N running`, plus one line per configured approval check with its current state.
@@ -73,3 +83,32 @@ State (retry count, limit, running/stopped) is persisted per run ID in `localSto
 Both scripts include `@updateURL` and `@downloadURL` headers pointing to this repository. Tampermonkey will check for updates automatically based on your configured update interval (default: once a day). You can also trigger a manual check via **Tampermonkey Dashboard → Check for updates**.
 
 Version bumps in the `@version` header are what trigger the update prompt.
+
+---
+
+## Headless CI Rerunner (`server-rerunner/`)
+
+For running CI reruns on a server without a browser, see [`server-rerunner/`](server-rerunner/) — a Python CLI that polls the GitHub API and retries failed jobs automatically.
+
+### Backport Tracker → gh-rerunner workflow
+
+1. Open your merged main-branch PR and let the Backport Tracker load all statuses.
+2. Configure **Ignore CI job** in ⚙ Settings if your repo has jobs that are flaky or irrelevant (e.g. `lint`, `build-docs`).
+3. Click **Copy summary**. The clipboard now contains a block like:
+   ```
+   # gh-rerunner: ignore_ci=lint,build-docs
+   [MERGED]   next/3.10.x: https://github.com/owner/repo/pull/100
+   [MERGED]   next/3.11.x: https://github.com/owner/repo/pull/101
+   [FETCHING] next/3.12.x: https://github.com/owner/repo/pull/102
+   [FAILURE]  next/3.13.x: https://github.com/owner/repo/pull/103
+   ```
+4. Pipe it to `gh-rerunner run` on your server (or locally):
+   ```bash
+   pbpaste | gh-rerunner run
+   ```
+   - `[MERGED]` and `[SUCCESS]` entries are skipped automatically.
+   - `[FETCHING]` entries emit a warning but are still watched.
+   - The `ignore_ci` header is read automatically — no extra flags needed.
+   - Failed jobs whose names match an ignored pattern are not retried.
+
+See [`server-rerunner/README.md`](server-rerunner/README.md) for installation, token setup, and full CLI reference.

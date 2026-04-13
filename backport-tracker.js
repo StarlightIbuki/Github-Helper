@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Backport Tracker
 // @namespace    https://github.com/StarlightIbuki
-// @version      1.0
+// @version      1.1
 // @description  Track backport PRs
 // @match        https://github.com/*/*/pull/*
 // @connect      github.com
@@ -478,8 +478,13 @@
             btn.style.fontSize = "11px";
             btn.textContent = "Copy summary";
             btn.onclick = () => {
-                const text = backportData.map(pr => `[${pr.merged ? 'MERGED' : pr.ciStatus.toUpperCase()}] ${pr.branch}: ${pr.url}`).join('\n');
-                navigator.clipboard.writeText(text);
+                const cfg = getRepoConfig(parseGithubUrl(window.location.href)?.repo);
+                const lines = [];
+                if (cfg.excludeCiJobs && cfg.excludeCiJobs.filter(j => j).length > 0) {
+                    lines.push(`# gh-rerunner: ignore_ci=${cfg.excludeCiJobs.filter(j => j).join(',')}`);
+                }
+                lines.push(...backportData.map(pr => `[${pr.merged ? 'MERGED' : pr.ciStatus.toUpperCase()}] ${pr.branch}: ${pr.url}`));
+                navigator.clipboard.writeText(lines.join('\n'));
             };
             root.appendChild(btn);
         }
