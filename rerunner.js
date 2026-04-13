@@ -42,6 +42,19 @@
 
     let state = loadState();
     let isTransitioning = false;
+    let pollInterval = null;
+
+    const startPolling = () => {
+        if (pollInterval) return;
+        pollInterval = setInterval(() => {
+            if (!state.isRunning) { stopPolling(); return; }
+            performCheck();
+        }, 3000);
+    };
+
+    const stopPolling = () => {
+        if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+    };
 
     // --- UI Logic ---
     const injectStyles = () => {
@@ -114,7 +127,7 @@
         if (successBadge) {
             log('Success detected. Stopping.');
             state.isRunning = false; state.status = 'finished';
-            saveState(state); updateUIState(); return;
+            saveState(state); updateUIState(); stopPolling(); return;
         }
 
         if (inProgressBadge) {
@@ -133,7 +146,7 @@
             } else {
                 log('Retry limit reached. Stopping.');
                 state.isRunning = false; state.status = 'limit';
-                saveState(state); updateUIState();
+                saveState(state); updateUIState(); stopPolling();
             }
         }
     };
@@ -281,7 +294,16 @@
             log('Toggle clicked. Running:', state.isRunning);
             saveState(state);
             updateUIState();
-            if (state.isRunning) performCheck();
+            if (state.isRunning) {
+                // Treat the click as an event: check immediately, then retry at 500ms/1.5s
+                // in case the badge isn't in the DOM yet (async render on static pages).
+                performCheck();
+                setTimeout(performCheck, 500);
+                setTimeout(performCheck, 1500);
+                startPolling();
+            } else {
+                stopPolling();
+            }
         };
 
         document.getElementById('tm-current-count').onclick = () => {
