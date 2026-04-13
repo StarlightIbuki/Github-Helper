@@ -233,9 +233,7 @@
         // ── Reviewer approvals via PR page HTML ────────────────────────────
         if (cfg.requiredReviews > 0 && result.ciStatus !== 'test_fail') {
             const approvedCount = doc.querySelectorAll(
-                '#partial-pull-reviewer-section .reviewers-status-icon .octicon-check, ' +
-                '[data-testid="reviewers-section"] .octicon-check.color-fg-success, ' +
-                '.js-reviewers-container .octicon-check'
+                '.reviewers-status-icon .octicon-check'
             ).length;
             if (approvedCount < cfg.requiredReviews) result.ciStatus = 'mgr_pending';
             condParts.push(`${approvedCount}/${cfg.requiredReviews} required approval(s)`);
