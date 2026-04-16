@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Backport Tracker
 // @namespace    https://github.com/StarlightIbuki
-// @version      1.2
+// @version      1.3
 // @description  Track backport PRs
-// @match        https://github.com/*/*/pull/*
+// @match        https://github.com/*
 // @connect      github.com
 // @run-at       document-start
 // @icon         https://raw.githubusercontent.com/primer/octicons/main/icons/git-pull-request-24.svg
@@ -19,6 +19,8 @@
     let isScanning = false;
     let refreshIntervalId = null;
     const MAX_RETRIES = 10;
+    const RESULTS_CACHE_KEY = 'bp_tracker_results_v1';
+    const RESULTS_CACHE_TTL_MS = 30 * 60 * 1000;
 
     const OCTICONS = {
         check: '<svg class="octicon octicon-check color-fg-success" viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>',
@@ -54,6 +56,59 @@
         try {
             const all = JSON.parse(localStorage.getItem(CONFIG_KEY) || '{}');
             localStorage.setItem(CONFIG_KEY, JSON.stringify({ ...all, [repo]: cfg }));
+        } catch {}
+    }
+
+    function getCurrentPrCacheKey() {
+        const parsed = parseGithubUrl(window.location.href);
+        if (!parsed) return null;
+        return `${parsed.repo}#${parsed.prNumber}`;
+    }
+
+    function loadCachedBackportData() {
+        const key = getCurrentPrCacheKey();
+        if (!key) return null;
+        try {
+            const all = JSON.parse(localStorage.getItem(RESULTS_CACHE_KEY) || '{}');
+            const entry = all[key];
+            if (!entry || !Array.isArray(entry.data) || !entry.ts) return null;
+            if (Date.now() - entry.ts > RESULTS_CACHE_TTL_MS) return null;
+            return entry.data;
+        } catch {
+            return null;
+        }
+    }
+
+    function saveCachedBackportData() {
+        const key = getCurrentPrCacheKey();
+        if (!key) return;
+        try {
+            const all = JSON.parse(localStorage.getItem(RESULTS_CACHE_KEY) || '{}');
+            const snapshot = backportData.map(pr => ({
+                branch: pr.branch || '',
+                url: pr.url || '',
+                id: pr.id || '?',
+                ciStatus: pr.ciStatus || '',
+                merged: !!pr.merged,
+                closed: !!pr.closed,
+                jumpUrl: pr.jumpUrl || pr.url || '',
+                tooltip: pr.tooltip || '',
+                state: pr.state || '',
+                skipStatusCheck: !!pr.skipStatusCheck,
+                customText: pr.customText || ''
+            }));
+            all[key] = { ts: Date.now(), data: snapshot };
+
+            const keys = Object.keys(all);
+            if (keys.length > 200) {
+                keys.sort((a, b) => (all[b]?.ts || 0) - (all[a]?.ts || 0));
+                const keep = new Set(keys.slice(0, 200));
+                Object.keys(all).forEach(k => {
+                    if (!keep.has(k)) delete all[k];
+                });
+            }
+
+            localStorage.setItem(RESULTS_CACHE_KEY, JSON.stringify(all));
         } catch {}
     }
 
@@ -108,25 +163,62 @@
         // First PR discussion body on GitHub pages is the original PR description.
         const body = document.querySelector('.timeline-comment-group .comment-body, [data-testid="issue-body"] [data-testid="markdown-body"]');
         if (!body) return '';
-        return body.innerText.trim().replace(/\s+/g, ' ');
+
+        const normalize = (input) => String(input || '')
+            .replace(/\r\n/g, '\n')
+            .replace(/[ \t]+$/gm, '')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+
+        // Use real heading nodes so parsing does not depend on markdown markers surviving render.
+        const headingEls = Array.from(body.querySelectorAll('h1,h2,h3,h4,h5,h6'));
+        const summaryHeading = headingEls.find(h => {
+            const title = (h.textContent || '').trim().replace(/[:：]$/, '');
+            return /^summary$/i.test(title);
+        });
+
+        if (summaryHeading) {
+            const summaryLevel = Number(summaryHeading.tagName.slice(1));
+            const sectionBlocks = [];
+            let node = summaryHeading.nextElementSibling;
+            while (node) {
+                if (/^H[1-6]$/.test(node.tagName) && Number(node.tagName.slice(1)) <= summaryLevel) break;
+                const blockText = normalize(node.innerText || node.textContent || '');
+                if (blockText) sectionBlocks.push(blockText);
+                node = node.nextElementSibling;
+            }
+
+            const sectionText = normalize(sectionBlocks.join('\n\n'));
+            if (sectionText) return sectionText;
+        }
+
+        return normalize(body.innerText || body.textContent || '');
     }
 
     function getCurrentPrTitle() {
-        const el = document.querySelector('[data-testid="issue-title"], .js-issue-title');
-        return el ? el.textContent.trim().replace(/\s+/g, ' ') : 'Pull Request';
+        const el = document.querySelector(
+            '[data-testid="issue-title"], ' +
+            '.js-issue-title, ' +
+            '[data-component="PH_Title"] .markdown-title, ' +
+            '.prc-PageHeader-TitleArea-2n2J0 .markdown-title, ' +
+            '.markdown-title'
+        );
+        if (el) return el.textContent.trim().replace(/\s+/g, ' ');
+
+        const title = document.title || '';
+        const cleaned = title
+            .replace(/\s*by\s+[^\-]+-\s*GitHub\s*$/i, '')
+            .replace(/\s*·\s*[^\-]+-\s*GitHub\s*$/i, '')
+            .trim();
+        return cleaned || 'Pull Request';
     }
 
     function escapeMetaValue(input) {
         return String(input || '').replace(/"/g, '&quot;');
     }
 
-    function base64EncodeUtf8(input) {
-        if (!input) return '';
-        try {
-            return btoa(unescape(encodeURIComponent(input)));
-        } catch {
-            return '';
-        }
+    function escapeMarkdownText(input) {
+        return String(input || '').replace(/([\[\]\\])/g, '\\$1');
     }
 
     async function getPrStatus(repo, prNumber) {
@@ -395,6 +487,15 @@
             return;
         }
 
+        if (retryCount === 0) {
+            const cached = loadCachedBackportData();
+            if (cached && cached.length > 0) {
+                backportData = cached;
+                renderListUI();
+                return;
+            }
+        }
+
         const root = document.getElementById('backport-ui-root');
         const comments = document.querySelectorAll('.comment-body, [data-testid="markdown-body"]');
 
@@ -499,6 +600,7 @@
         });
 
         root.appendChild(list);
+        if (backportData.length > 0) saveCachedBackportData();
 
         if (!backportData.some(pr => pr.skipStatusCheck)) {
             function getSummaryTextFromHover(pr) {
@@ -543,19 +645,20 @@
                 const lines = [];
                 const title = getCurrentPrTitle();
                 const prNum = parsedCurrent?.prNumber || '?';
-                lines.push(`# Backport PRs for "${title}" #${prNum}`);
+                lines.push(`# Backport PRs for [${escapeMarkdownText(`${title} #${prNum}`)}](${window.location.href})`);
 
                 const metaAttrs = [];
                 metaAttrs.push(`format="2"`);
-                metaAttrs.push(`source_pr="${escapeMetaValue(window.location.href)}"`);
                 const sourcePrDescription = extractOriginalPrDescription();
-                if (sourcePrDescription) {
-                    metaAttrs.push(`source_pr_description_b64="${base64EncodeUtf8(sourcePrDescription)}"`);
-                }
                 if (cfg.excludeCiJobs && cfg.excludeCiJobs.filter(j => j).length > 0) {
                     metaAttrs.push(`ignore_ci="${escapeMetaValue(cfg.excludeCiJobs.filter(j => j).join(','))}"`);
                 }
                 lines.push(`<!-- gh-rerunner: ${metaAttrs.join(' ')} -->`);
+                if (sourcePrDescription) {
+                    sourcePrDescription.split(/\r?\n/).forEach(line => {
+                        lines.push(`> ${escapeMarkdownText(line)}`);
+                    });
+                }
                 lines.push(...backportData.map(pr => `- [${pr.branch}](${pr.url}) ${getSummaryTextFromHover(pr)}`));
                 navigator.clipboard.writeText(lines.join('\n'));
             };
