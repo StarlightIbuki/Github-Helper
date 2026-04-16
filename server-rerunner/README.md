@@ -128,9 +128,11 @@ cat summary.txt | gh-rerunner run -n 5
 In the Backport Tracker sidebar panel, click **Copy summary**. The output looks like:
 
 ```
-[OPEN]   release-1.2: https://github.com/owner/repo/pull/111
-[MERGED] release-1.3: https://github.com/owner/repo/pull/112
-[OPEN]   release-1.4: https://github.com/owner/repo/pull/113
+# Backport PRs for "Fix: clustering syncing issue" #3125
+<!-- gh-rerunner: format="2" source_pr="https://github.com/owner/repo/pull/3125" source_pr_description_b64="..." ignore_ci="lint,build-docs" -->
+- [release-1.2](https://github.com/owner/repo/pull/111) CI pending
+- [release-1.3](https://github.com/owner/repo/pull/112) Merged
+- [release-1.4](https://github.com/owner/repo/pull/113) 1 Review required; 1 label required; CI failed
 ```
 
 Pipe it straight to `gh-rerunner run` — it extracts all GitHub URLs automatically:

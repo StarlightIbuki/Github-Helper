@@ -26,6 +26,21 @@ def bp_summary(*entries: tuple[str, str, str], ignore_ci: Optional[list[str]] = 
     return "\n".join(lines)
 
 
+def bp_markdown_summary(
+    title: str,
+    pr_number: int,
+    entries: list[tuple[str, str, str]],
+    metadata: Optional[dict[str, str]] = None,
+) -> str:
+    """Build markdown copy-summary string from backport-tracker."""
+    lines = [f"# Backport PRs for \"{title}\" #{pr_number}"]
+    if metadata:
+        attrs = " ".join(f'{k}="{v}"' for k, v in metadata.items())
+        lines.append(f"<!-- gh-rerunner: {attrs} -->")
+    lines.extend(f"- [{branch}]({url}) {detail}" for branch, url, detail in entries)
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # _extract_urls — backport-tracker output
 # ---------------------------------------------------------------------------
@@ -183,6 +198,7 @@ class TestParseSummary:
         assert result.entries[2].status == "fetching"
         assert result.entries[2].url == "https://github.com/Kong/kong-ee/pull/17018"
         assert result.ignore_ci == []
+        assert result.metadata == {}
 
     def test_all_statuses_captured(self):
         statuses = ["MERGED", "OPEN", "CLOSED", "SUCCESS", "FAILURE",
@@ -203,6 +219,7 @@ class TestParseSummary:
         )
         result = _parse_summary(text)
         assert result.ignore_ci == ["lint"]
+        assert result.metadata["ignore_ci"] == "lint"
 
     def test_ignore_ci_header_multiple_jobs(self):
         text = bp_summary(
@@ -211,6 +228,7 @@ class TestParseSummary:
         )
         result = _parse_summary(text)
         assert result.ignore_ci == ["lint", "build-docs", "typecheck"]
+        assert result.metadata["ignore_ci"] == "lint,build-docs,typecheck"
 
     def test_ignore_ci_header_with_spaces_around_commas(self):
         text = "# gh-rerunner: ignore_ci=lint , build , typecheck\n[OPEN] x: https://github.com/org/repo/pull/1"
@@ -224,7 +242,9 @@ class TestParseSummary:
 
     def test_no_ignore_ci_header_returns_empty_list(self):
         text = bp_summary(("OPEN", "next/3.12.x", "https://github.com/org/repo/pull/1"))
-        assert _parse_summary(text).ignore_ci == []
+        parsed = _parse_summary(text)
+        assert parsed.ignore_ci == []
+        assert parsed.metadata == {}
 
     def test_full_summary_with_config_header(self):
         """Combined: config header + mixed statuses, as backport-tracker would emit."""
@@ -245,6 +265,62 @@ class TestParseSummary:
         assert len(fetching) == 1
         assert len(failure) == 1
 
+    def test_v2_metadata_headers_are_parsed(self):
+        text = "\n".join([
+            "# gh-rerunner: format=2",
+            "# gh-rerunner: source_pr=https://github.com/org/repo/pull/999",
+            "# gh-rerunner: source_pr_description_b64=UFIgZGVzY3JpcHRpb24=",
+            "# gh-rerunner: ignore_ci=lint,build",
+            "[OPEN] next/3.12.x: https://github.com/org/repo/pull/1 | ci=passed=2,failed=0",
+        ])
+        result = _parse_summary(text)
+        assert result.ignore_ci == ["lint", "build"]
+        assert result.metadata == {
+            "format": "2",
+            "source_pr": "https://github.com/org/repo/pull/999",
+            "source_pr_description_b64": "UFIgZGVzY3JpcHRpb24=",
+            "ignore_ci": "lint,build",
+        }
+        assert len(result.entries) == 1
+        assert result.entries[0].url == "https://github.com/org/repo/pull/1"
+
+    def test_markdown_summary_with_meta_comment(self):
+        text = bp_markdown_summary(
+            title="Fix: clustering syncing issue",
+            pr_number=3125,
+            metadata={
+                "format": "2",
+                "ignore_ci": "lint,build-docs",
+                "source_pr": "https://github.com/org/repo/pull/3125",
+                "source_pr_description_b64": "Rml4IGRlc2NyaXB0aW9u",
+            },
+            entries=[
+                ("next/3.11.x.x", "https://github.com/org/repo/pull/11", "Merged"),
+                ("next/3.12.x.x", "https://github.com/org/repo/pull/12", "1 Review required; 1 label required; CI failed"),
+                ("next/3.13.x.x", "https://github.com/org/repo/pull/13", "CI failed"),
+            ],
+        )
+        result = _parse_summary(text)
+        assert result.ignore_ci == ["lint", "build-docs"]
+        assert result.metadata["format"] == "2"
+        assert result.metadata["source_pr"] == "https://github.com/org/repo/pull/3125"
+        assert result.metadata["source_pr_description_b64"] == "Rml4IGRlc2NyaXB0aW9u"
+        assert [(e.status, e.url) for e in result.entries] == [
+            ("merged", "https://github.com/org/repo/pull/11"),
+            ("failure", "https://github.com/org/repo/pull/12"),
+            ("failure", "https://github.com/org/repo/pull/13"),
+        ]
+
+    def test_markdown_meta_only_does_not_create_targets(self):
+        text = "\n".join([
+            '# Backport PRs for "Fix" #100',
+            '<!-- gh-rerunner: source_pr="https://github.com/org/repo/pull/100" ignore_ci="lint" -->',
+        ])
+        result = _parse_summary(text)
+        assert result.entries == []
+        assert result.ignore_ci == ["lint"]
+        assert result.metadata["source_pr"] == "https://github.com/org/repo/pull/100"
+
     # ── Fallback: bare URLs without status prefix ─────────────────────────────
 
     def test_bare_url_falls_back_to_empty_status(self):
@@ -254,7 +330,17 @@ class TestParseSummary:
         assert result.entries[0].url == url
         assert result.entries[0].status == ""
 
+    def test_metadata_header_url_not_used_as_fallback_target(self):
+        text = "\n".join([
+            "# gh-rerunner: source_pr=https://github.com/org/repo/pull/999",
+            "# gh-rerunner: format=2",
+        ])
+        result = _parse_summary(text)
+        assert result.entries == []
+        assert result.metadata["source_pr"] == "https://github.com/org/repo/pull/999"
+
     def test_empty_input(self):
         result = _parse_summary("")
         assert result.entries == []
         assert result.ignore_ci == []
+        assert result.metadata == {}

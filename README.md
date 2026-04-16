@@ -33,17 +33,16 @@ Injects a **Backports** panel into the PR sidebar that automatically finds and t
   - **Required label** — label name substring that must be present on the PR.
   - **Required review approvals** — minimum number of approved reviews required.
   - All three fields are optional and independent; set only what your repo uses.
-- **Copy summary** — copies a plain-text status summary to the clipboard. Each line follows the format:
+- **Copy summary** — copies a markdown summary to the clipboard:
   ```
-  [STATUS] branch-name: https://github.com/owner/repo/pull/123
+  # Backport PRs for "Fix: clustering syncing issue" #3125
+  <!-- gh-rerunner: format="2" source_pr="https://github.com/owner/repo/pull/3125" source_pr_description_b64="..." ignore_ci="lint,build-docs" -->
+  - [next/3.11.x.x](https://github.com/owner/repo/pull/4001) Merged
+  - [next/3.12.x.x](https://github.com/owner/repo/pull/4002) 1 Review required; 1 label required; CI failed
+  - [next/3.13.x.x](https://github.com/owner/repo/pull/4003) CI failed
   ```
-  If **Ignore CI job** is configured, a machine-readable header is prepended so `gh-rerunner` can pick it up automatically:
-  ```
-  # gh-rerunner: ignore_ci=lint,build-docs
-  [MERGED]   next/3.10.x: https://github.com/owner/repo/pull/100
-  [FETCHING] next/3.11.x: https://github.com/owner/repo/pull/101
-  [FAILURE]  next/3.12.x: https://github.com/owner/repo/pull/102
-  ```
+  The list text is derived from the same status/hover data used by the UI.
+  The metadata comment is machine-readable for `gh-rerunner` and includes the source PR URL, source PR description (base64), and optional `ignore_ci` patterns.
 - **Auto-refresh** — statuses are refreshed automatically every 30 seconds.
 
 **Tooltip** (hover any row) shows a breakdown: `CI: N passed, N failed, N running`, plus one line per configured approval check with its current state.
@@ -96,19 +95,20 @@ For running CI reruns on a server without a browser, see [`server-rerunner/`](se
 2. Configure **Ignore CI job** in ⚙ Settings if your repo has jobs that are flaky or irrelevant (e.g. `lint`, `build-docs`).
 3. Click **Copy summary**. The clipboard now contains a block like:
    ```
-   # gh-rerunner: ignore_ci=lint,build-docs
-   [MERGED]   next/3.10.x: https://github.com/owner/repo/pull/100
-   [MERGED]   next/3.11.x: https://github.com/owner/repo/pull/101
-   [FETCHING] next/3.12.x: https://github.com/owner/repo/pull/102
-   [FAILURE]  next/3.13.x: https://github.com/owner/repo/pull/103
+  # Backport PRs for "Fix: clustering syncing issue" #3125
+  <!-- gh-rerunner: format="2" source_pr="https://github.com/owner/repo/pull/3125" source_pr_description_b64="..." ignore_ci="lint,build-docs" -->
+  - [next/3.10.x](https://github.com/owner/repo/pull/100) Merged
+  - [next/3.11.x](https://github.com/owner/repo/pull/101) Merged
+  - [next/3.12.x](https://github.com/owner/repo/pull/102) CI pending
+  - [next/3.13.x](https://github.com/owner/repo/pull/103) CI failed
    ```
 4. Pipe it to `gh-rerunner run` on your server (or locally):
    ```bash
    pbpaste | gh-rerunner run
    ```
-   - `[MERGED]` and `[SUCCESS]` entries are skipped automatically.
-   - `[FETCHING]` entries emit a warning but are still watched.
-   - The `ignore_ci` header is read automatically — no extra flags needed.
+  - `Merged` entries are skipped automatically.
+  - `CI pending` entries emit a warning but are still watched.
+  - The `ignore_ci` metadata is read automatically — no extra flags needed.
    - Failed jobs whose names match an ignored pattern are not retried.
 
 See [`server-rerunner/README.md`](server-rerunner/README.md) for installation, token setup, and full CLI reference.

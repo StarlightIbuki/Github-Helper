@@ -28,17 +28,131 @@ _SKIP_STATUSES = {"merged", "success", "closed"}
 # Summary status hints that mean CI data is not yet available
 _WARN_STATUSES = {"fetching"}
 
-# Header line emitted by backport-tracker: "# gh-rerunner: ignore_ci=job1,job2"
-_CONFIG_RE = re.compile(
-    r"^#\s*gh-rerunner:\s*ignore_ci=(?P<jobs>[^\r\n]+)",
+# Header lines emitted by backport-tracker:
+#   # gh-rerunner: key=value
+_HEADER_RE = re.compile(
+    r"^#\s*gh-rerunner:\s*(?P<key>[a-z0-9_\-]+)=(?P<value>[^\r\n]*)$",
     re.MULTILINE | re.IGNORECASE,
+)
+
+# Markdown metadata comment emitted by backport-tracker, e.g.:
+#   <!-- gh-rerunner: ignore_ci="lint,build" source_pr="..." -->
+_META_COMMENT_RE = re.compile(
+    r"^\s*<!--\s*gh-rerunner:\s*(?P<body>.*?)\s*-->\s*$",
+    re.IGNORECASE,
+)
+
+_META_ATTR_RE = re.compile(
+    r"([a-z0-9_\-]+)\s*=\s*\"([^\"]*)\"|([a-z0-9_\-]+)\s*=\s*([^\s\"]+)",
+    re.IGNORECASE,
 )
 
 # Summary entry line:  [STATUS] branch: URL
 _ENTRY_RE = re.compile(
-    r"^\[(?P<status>[A-Z_]+)\]\s+[^:]+:\s+(?P<url>https://github\.com/\S+)",
-    re.MULTILINE,
+    r"^\[(?P<status>[A-Z_]+)\]\s+[^:]+:\s+(?P<url>https://github\.com/\S+)\s*$",
 )
+
+# Markdown entry line: - [branch](URL) Detail text
+_MD_ENTRY_RE = re.compile(
+    r"^\s*-\s+\[[^\]]+\]\((?P<url>https://github\.com/\S+)\)\s*(?P<detail>.*)$",
+)
+
+
+def _infer_status_from_markdown_detail(detail: str) -> str:
+    """Infer a status hint from markdown detail text."""
+    d = detail.strip().lower()
+    if not d:
+        return ""
+    if "merged" in d:
+        return "merged"
+    if "closed" in d:
+        return "closed"
+    if "ci pending" in d or "fetching" in d:
+        return "fetching"
+    if "ci failed" in d:
+        return "failure"
+    if "ci passed" in d:
+        return "success"
+    return ""
+
+
+def _parse_meta_comment_attrs(body: str) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for m in _META_ATTR_RE.finditer(body):
+        if m.group(1):
+            attrs[m.group(1).lower()] = m.group(2)
+        elif m.group(3):
+            attrs[m.group(3).lower()] = m.group(4)
+    return attrs
+
+
+def _is_metadata_line(line: str) -> bool:
+    return _HEADER_RE.match(line) is not None or _META_COMMENT_RE.match(line) is not None
+
+
+def _extract_line_url(url_part: str) -> Optional[str]:
+    m = _URL_RE.search(url_part)
+    if not m:
+        return None
+    return m.group(0)
+
+
+def _append_entry(entries: list[SummaryEntry], seen: set[str], status: str, url: str) -> None:
+    if url not in seen:
+        seen.add(url)
+        entries.append(SummaryEntry(status, url))
+
+
+def _parse_structured_line(line: str) -> Optional[tuple[str, str]]:
+    legacy = _ENTRY_RE.match(line)
+    if legacy:
+        clean = _extract_line_url(legacy.group("url"))
+        if clean:
+            return legacy.group("status"), clean
+
+    markdown = _MD_ENTRY_RE.match(line)
+    if markdown:
+        clean = _extract_line_url(markdown.group("url"))
+        if clean:
+            status = _infer_status_from_markdown_detail(markdown.group("detail"))
+            return status, clean
+
+    return None
+
+
+def _collect_metadata(text: str) -> tuple[dict[str, str], list[str]]:
+    metadata: dict[str, str] = {}
+    ignore_ci: list[str] = []
+
+    for m in _HEADER_RE.finditer(text):
+        key = m.group("key").lower().strip()
+        value = m.group("value").strip()
+        metadata[key] = value
+        if key == "ignore_ci":
+            ignore_ci = [j.strip() for j in value.split(",") if j.strip()]
+
+    for line in text.splitlines():
+        c = _META_COMMENT_RE.match(line)
+        if not c:
+            continue
+        attrs = _parse_meta_comment_attrs(c.group("body"))
+        metadata.update(attrs)
+        if "ignore_ci" in attrs:
+            ignore_ci = [j.strip() for j in attrs["ignore_ci"].split(",") if j.strip()]
+
+    return metadata, ignore_ci
+
+
+def _collect_structured_entries(text: str) -> list[SummaryEntry]:
+    entries: list[SummaryEntry] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        parsed = _parse_structured_line(line)
+        if not parsed:
+            continue
+        status, url = parsed
+        _append_entry(entries, seen, status, url)
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -68,52 +182,50 @@ class SummaryEntry:
 
 class ParsedSummary:
     """Result of parsing a backport-tracker copy-summary block."""
-    __slots__ = ("entries", "ignore_ci")
+    __slots__ = ("entries", "ignore_ci", "metadata")
 
     def __init__(
         self,
         entries: list[SummaryEntry],
         ignore_ci: list[str],
+        metadata: dict[str, str],
     ) -> None:
         self.entries = entries
         self.ignore_ci = ignore_ci
+        self.metadata = metadata
 
 
 def _parse_summary(text: str) -> ParsedSummary:
     """Parse a backport-tracker copy-summary block.
 
     Extracts:
-    - Per-PR status hints and URLs (``[STATUS] branch: url`` lines)
-    - Optional ``# gh-rerunner: ignore_ci=job1,job2`` config header
+        - Per-PR status hints and URLs from either format:
+            - Legacy: ``[STATUS] branch: url``
+            - Markdown: ``- [branch](url) Detail text``
+        - Optional metadata from either format:
+            - ``# gh-rerunner: key=value``
+            - ``<!-- gh-rerunner: key="value" -->``
 
     For plain URL lists (no status prefix) each URL is returned with
     status='' so the caller treats them as unknown.
     """
-    # --- Config header ---
-    ignore_ci: list[str] = []
-    cfg_m = _CONFIG_RE.search(text)
-    if cfg_m:
-        ignore_ci = [j.strip() for j in cfg_m.group("jobs").split(",") if j.strip()]
+    # --- Config / metadata headers ---
+    metadata, ignore_ci = _collect_metadata(text)
 
-    # --- Structured entries ---
-    seen: set[str] = set()
-    entries: list[SummaryEntry] = []
+    # --- Structured entries (legacy + markdown) ---
+    entries = _collect_structured_entries(text)
 
-    for m in _ENTRY_RE.finditer(text):
-        url = _URL_RE.search(m.group("url"))
-        if not url:
-            continue
-        clean_url = url.group(0)
-        if clean_url not in seen:
-            seen.add(clean_url)
-            entries.append(SummaryEntry(m.group("status"), clean_url))
-
-    # Fall back to bare URL extraction if no structured entries found
+    # Fall back to bare URL extraction if no structured entries found.
+    # Ignore metadata header lines so source_pr URLs don't become watch targets.
     if not entries:
-        for url in _extract_urls(text):
+        content_without_headers = "\n".join(
+            line for line in text.splitlines()
+            if not _is_metadata_line(line)
+        )
+        for url in _extract_urls(content_without_headers):
             entries.append(SummaryEntry("", url))
 
-    return ParsedSummary(entries, ignore_ci)
+    return ParsedSummary(entries, ignore_ci, metadata)
 
 
 def _all_failures_ignored(run: WorkflowRun, ignore_ci: list[str]) -> bool:
@@ -308,11 +420,11 @@ def run_cmd(
 
     \b
     When stdin is a pipe, GitHub URLs are read from it automatically — with
-    or without explicit TARGETS. This accepts the copy-summary output from
-    backport-tracker.js (including its encoded ignore_ci config header), e.g.:
-      # gh-rerunner: ignore_ci=lint,build
-      [OPEN]   release-1.2: https://github.com/owner/repo/pull/456
-      [MERGED] release-1.3: https://github.com/owner/repo/pull/457
+        or without explicit TARGETS. This accepts copy-summary output from
+        backport-tracker.js in either legacy or markdown format, e.g.:
+            <!-- gh-rerunner: ignore_ci="lint,build" -->
+            - [release-1.2](https://github.com/owner/repo/pull/456) CI failed
+            - [release-1.3](https://github.com/owner/repo/pull/457) Merged
 
     \b
     Quick-start examples:

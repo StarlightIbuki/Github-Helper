@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Backport Tracker
 // @namespace    https://github.com/StarlightIbuki
-// @version      1.1
+// @version      1.2
 // @description  Track backport PRs
 // @match        https://github.com/*/*/pull/*
 // @connect      github.com
@@ -102,6 +102,31 @@
 
         if (!branchName) return null;
         return { isBackport: branchName !== 'master' && branchName !== 'main', baseBranch: branchName };
+    }
+
+    function extractOriginalPrDescription() {
+        // First PR discussion body on GitHub pages is the original PR description.
+        const body = document.querySelector('.timeline-comment-group .comment-body, [data-testid="issue-body"] [data-testid="markdown-body"]');
+        if (!body) return '';
+        return body.innerText.trim().replace(/\s+/g, ' ');
+    }
+
+    function getCurrentPrTitle() {
+        const el = document.querySelector('[data-testid="issue-title"], .js-issue-title');
+        return el ? el.textContent.trim().replace(/\s+/g, ' ') : 'Pull Request';
+    }
+
+    function escapeMetaValue(input) {
+        return String(input || '').replace(/"/g, '&quot;');
+    }
+
+    function base64EncodeUtf8(input) {
+        if (!input) return '';
+        try {
+            return btoa(unescape(encodeURIComponent(input)));
+        } catch {
+            return '';
+        }
     }
 
     async function getPrStatus(repo, prNumber) {
@@ -241,7 +266,7 @@
         }
 
         // ── Label check via PR page HTML ───────────────────────────────────
-        if (cfg.requiredLabels.length > 0 && result.ciStatus !== 'test_fail') {
+        if (cfg.requiredLabels.length > 0) {
             const labelEls = doc.querySelectorAll(
                 'a.IssueLabel, .hx_IssueLabel, ' +
                 '[data-testid="labels-section-list"] a, ' +
@@ -251,18 +276,21 @@
             const presentNames = Array.from(new Set(
                 Array.from(labelEls).map(el => el.textContent.trim().toLowerCase()).filter(Boolean)
             ));
-            const presentCount = cfg.requiredLabels.filter(req =>
-                presentNames.some(n => n.includes(req.toLowerCase()))).length;
-            if (presentCount < cfg.requiredLabels.length) result.ciStatus = 'label_required';
+            const matchedLabels = cfg.requiredLabels.filter(req =>
+                presentNames.some(n => n.includes(req.toLowerCase())));
+            const missingLabels = cfg.requiredLabels.filter(req =>
+                !presentNames.some(n => n.includes(req.toLowerCase())));
+            const presentCount = matchedLabels.length;
+            if (presentCount < cfg.requiredLabels.length && result.ciStatus !== 'test_fail') result.ciStatus = 'label_required';
             condParts.push(`${presentCount}/${cfg.requiredLabels.length} required label(s)`);
         }
 
         // ── Reviewer approvals via PR page HTML ────────────────────────────
-        if (cfg.requiredReviews > 0 && result.ciStatus !== 'test_fail') {
+        if (cfg.requiredReviews > 0) {
             const approvedCount = doc.querySelectorAll(
                 '.reviewers-status-icon .octicon-check'
             ).length;
-            if (approvedCount < cfg.requiredReviews) result.ciStatus = 'review_required';
+            if (approvedCount < cfg.requiredReviews && result.ciStatus !== 'test_fail') result.ciStatus = 'review_required';
             condParts.push(`${approvedCount}/${cfg.requiredReviews} required approval(s)`);
         }
 
@@ -473,17 +501,62 @@
         root.appendChild(list);
 
         if (!backportData.some(pr => pr.skipStatusCheck)) {
+            function getSummaryTextFromHover(pr) {
+                if (pr.merged) return 'Merged';
+                if (pr.closed) return 'Closed';
+
+                const tooltip = (pr.tooltip || '').toLowerCase();
+                const parts = [];
+
+                const reviewMatch = tooltip.match(/(\d+)\/(\d+)\s+required approval\(s\)/i);
+                if (reviewMatch) {
+                    const have = Number(reviewMatch[1]);
+                    const need = Number(reviewMatch[2]);
+                    const missing = Math.max(need - have, 0);
+                    if (missing > 0) parts.push(`${missing} Review required`);
+                }
+
+                const labelMatch = tooltip.match(/(\d+)\/(\d+)\s+required label\(s\)/i);
+                if (labelMatch) {
+                    const have = Number(labelMatch[1]);
+                    const need = Number(labelMatch[2]);
+                    const missing = Math.max(need - have, 0);
+                    if (missing > 0) parts.push(`${missing} label required`);
+                }
+
+                if (pr.ciStatus === 'test_fail' || /\b\d+\s+failed\b/i.test(tooltip)) parts.push('CI failed');
+                else if (pr.ciStatus === 'pending' || pr.ciStatus === 'fetching' || /\b\d+\s+running\b/i.test(tooltip)) parts.push('CI pending');
+                else if (pr.ciStatus === 'error') parts.push('CI unavailable');
+                else if (pr.ciStatus === 'success') parts.push('CI passed');
+
+                if (parts.length === 0) return (pr.tooltip || 'Open').replace(/\s+/g, ' ').trim();
+                return parts.join('; ');
+            }
+
             const btn = document.createElement('button');
             btn.className = "btn btn-sm btn-block mt-2";
             btn.style.fontSize = "11px";
             btn.textContent = "Copy summary";
             btn.onclick = () => {
-                const cfg = getRepoConfig(parseGithubUrl(window.location.href)?.repo);
+                const parsedCurrent = parseGithubUrl(window.location.href);
+                const cfg = getRepoConfig(parsedCurrent?.repo);
                 const lines = [];
-                if (cfg.excludeCiJobs && cfg.excludeCiJobs.filter(j => j).length > 0) {
-                    lines.push(`# gh-rerunner: ignore_ci=${cfg.excludeCiJobs.filter(j => j).join(',')}`);
+                const title = getCurrentPrTitle();
+                const prNum = parsedCurrent?.prNumber || '?';
+                lines.push(`# Backport PRs for "${title}" #${prNum}`);
+
+                const metaAttrs = [];
+                metaAttrs.push(`format="2"`);
+                metaAttrs.push(`source_pr="${escapeMetaValue(window.location.href)}"`);
+                const sourcePrDescription = extractOriginalPrDescription();
+                if (sourcePrDescription) {
+                    metaAttrs.push(`source_pr_description_b64="${base64EncodeUtf8(sourcePrDescription)}"`);
                 }
-                lines.push(...backportData.map(pr => `[${pr.merged ? 'MERGED' : pr.ciStatus.toUpperCase()}] ${pr.branch}: ${pr.url}`));
+                if (cfg.excludeCiJobs && cfg.excludeCiJobs.filter(j => j).length > 0) {
+                    metaAttrs.push(`ignore_ci="${escapeMetaValue(cfg.excludeCiJobs.filter(j => j).join(','))}"`);
+                }
+                lines.push(`<!-- gh-rerunner: ${metaAttrs.join(' ')} -->`);
+                lines.push(...backportData.map(pr => `- [${pr.branch}](${pr.url}) ${getSummaryTextFromHover(pr)}`));
                 navigator.clipboard.writeText(lines.join('\n'));
             };
             root.appendChild(btn);
