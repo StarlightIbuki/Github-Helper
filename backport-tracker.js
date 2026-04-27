@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Backport Tracker
 // @namespace    https://github.com/StarlightIbuki
-// @version      1.3
+// @version      1.4
 // @description  Track backport PRs
 // @match        https://github.com/*
 // @connect      github.com
@@ -16,8 +16,10 @@
 
     let backportData = [];
     let currentPrUrl = "";
+    let currentPrCacheKey = null;
     let isScanning = false;
     let refreshIntervalId = null;
+    let activeSessionId = 0;
     const MAX_RETRIES = 10;
     const RESULTS_CACHE_KEY = 'bp_tracker_results_v1';
     const RESULTS_CACHE_TTL_MS = 30 * 60 * 1000;
@@ -65,6 +67,12 @@
         return `${parsed.repo}#${parsed.prNumber}`;
     }
 
+    function getCacheKeyFromUrl(url) {
+        const parsed = parseGithubUrl(url);
+        if (!parsed) return null;
+        return `${parsed.repo}#${parsed.prNumber}`;
+    }
+
     function loadCachedBackportData() {
         const key = getCurrentPrCacheKey();
         if (!key) return null;
@@ -79,8 +87,8 @@
         }
     }
 
-    function saveCachedBackportData() {
-        const key = getCurrentPrCacheKey();
+    function saveCachedBackportData(cacheKey) {
+        const key = cacheKey || getCurrentPrCacheKey();
         if (!key) return;
         try {
             const all = JSON.parse(localStorage.getItem(RESULTS_CACHE_KEY) || '{}');
@@ -392,8 +400,8 @@
         return result;
     }
 
-    async function triggerRefresh() {
-        if (isScanning || backportData.length === 0) return;
+    async function triggerRefresh(sessionId = activeSessionId) {
+        if (sessionId !== activeSessionId || isScanning || backportData.length === 0) return;
 
         const btn = document.querySelector('#backport-refresh-btn');
         if (btn) btn.querySelector('svg').classList.add('anim-rotate');
@@ -401,6 +409,7 @@
         try {
             isScanning = true;
             for (const pr of backportData) {
+                if (sessionId !== activeSessionId) return;
                 if (pr.skipStatusCheck || pr.merged || pr.closed || pr.ciStatus === 'success') {
                     continue;
                 }
@@ -408,15 +417,16 @@
                 const parsed = parseGithubUrl(pr.url);
                 if (parsed) {
                     pr.ciStatus = 'fetching';
-                    renderListUI();
+                    renderListUI(sessionId);
 
                     const info = await getPrStatus(parsed.repo, parsed.prNumber);
+                    if (sessionId !== activeSessionId) return;
                     Object.assign(pr, info);
-                    renderListUI();
+                    renderListUI(sessionId);
                 }
             }
         } finally {
-            isScanning = false;
+            if (sessionId === activeSessionId) isScanning = false;
             if (btn) btn.querySelector('svg').classList.remove('anim-rotate');
         }
     }
@@ -473,10 +483,11 @@
         return found;
     }
 
-    async function attemptAutoScan(retryCount) {
+    async function attemptAutoScan(retryCount, sessionId = activeSessionId) {
+        if (sessionId !== activeSessionId) return;
         const prContext = getPrContext();
         if (!prContext && retryCount < MAX_RETRIES) {
-            setTimeout(() => attemptAutoScan(retryCount + 1), 1000);
+            setTimeout(() => attemptAutoScan(retryCount + 1, sessionId), 1000);
             return;
         }
 
@@ -487,11 +498,13 @@
             return;
         }
 
+        if (sessionId !== activeSessionId) return;
+
         if (retryCount === 0) {
             const cached = loadCachedBackportData();
             if (cached && cached.length > 0) {
                 backportData = cached;
-                renderListUI();
+                renderListUI(sessionId);
                 return;
             }
         }
@@ -503,7 +516,7 @@
         if (prContext.isBackport) {
             if (comments.length === 0) {
                 if (retryCount < MAX_RETRIES) {
-                    setTimeout(() => attemptAutoScan(retryCount + 1), 1000);
+                    setTimeout(() => attemptAutoScan(retryCount + 1, sessionId), 1000);
                 } else if (root) {
                     root.innerHTML = `<div class="color-fg-muted f6">No backport PR</div>`;
                 }
@@ -520,7 +533,8 @@
                     skipStatusCheck: true,
                     customText: `Backporting #${origPrId}`
                 }];
-                renderListUI();
+                if (sessionId !== activeSessionId) return;
+                renderListUI(sessionId);
             } else {
                 if (root) root.innerHTML = `<div class="color-fg-muted f6">No backport PR</div>`;
             }
@@ -538,24 +552,28 @@
 
         if (found.length > 0) {
             backportData = found.map(pr => ({ ...pr, id: parseGithubUrl(pr.url)?.prNumber || '?', ciStatus: 'fetching' }));
-            renderListUI();
+            if (sessionId !== activeSessionId) return;
+            renderListUI(sessionId);
 
             for (const pr of backportData) {
+                if (sessionId !== activeSessionId) return;
                 const parsed = parseGithubUrl(pr.url);
                 if (parsed) {
                     const info = await getPrStatus(parsed.repo, parsed.prNumber);
+                    if (sessionId !== activeSessionId) return;
                     Object.assign(pr, info);
-                    renderListUI();
+                    renderListUI(sessionId);
                 }
             }
         } else if (retryCount < MAX_RETRIES) {
-            setTimeout(() => attemptAutoScan(retryCount + 1), 1000);
+            setTimeout(() => attemptAutoScan(retryCount + 1, sessionId), 1000);
         } else {
             if (root) root.innerHTML = `<div class="color-fg-muted f6">No backport PR</div>`;
         }
     }
 
-    function renderListUI() {
+    function renderListUI(sessionId = activeSessionId) {
+        if (sessionId !== activeSessionId) return;
         const root = document.getElementById('backport-ui-root');
         if (!root) return;
         root.innerHTML = "";
@@ -600,7 +618,7 @@
         });
 
         root.appendChild(list);
-        if (backportData.length > 0) saveCachedBackportData();
+        if (backportData.length > 0) saveCachedBackportData(currentPrCacheKey);
 
         if (!backportData.some(pr => pr.skipStatusCheck)) {
             function getSummaryTextFromHover(pr) {
@@ -725,7 +743,7 @@
         `;
 
         sidebar.prepend(section);
-        document.getElementById('backport-refresh-btn').addEventListener('click', () => triggerRefresh());
+        document.getElementById('backport-refresh-btn').addEventListener('click', () => triggerRefresh(activeSessionId));
 
         const settingsBtn = document.getElementById('backport-settings-btn');
         const settingsPanel = document.getElementById('backport-settings-panel');
@@ -809,24 +827,50 @@
         }, 500);
     }
 
-    const observer = new MutationObserver(() => {
-        if (!window.location.pathname.includes('/pull/')) return;
+    function resetForRoute(url) {
+        currentPrUrl = url;
+        currentPrCacheKey = getCacheKeyFromUrl(url);
+        activeSessionId += 1;
+        backportData = [];
+        isScanning = false;
+        if (refreshIntervalId) { clearInterval(refreshIntervalId); refreshIntervalId = null; }
+        const oldWidget = document.getElementById('backport-tracker-section');
+        if (oldWidget) oldWidget.remove();
+    }
 
-        if (currentPrUrl !== window.location.href) {
-            currentPrUrl = window.location.href;
-            backportData = [];
-            isScanning = false;
-            if (refreshIntervalId) { clearInterval(refreshIntervalId); refreshIntervalId = null; }
-            const oldWidget = document.getElementById('backport-tracker-section');
-            if (oldWidget) oldWidget.remove();
-        }
+    function bootstrapIfNeeded() {
+        if (!window.location.pathname.includes('/pull/')) return;
+        if (currentPrUrl !== window.location.href) resetForRoute(window.location.href);
 
         const sidebar = document.querySelector('.Layout-sidebar, #partial-discussion-sidebar, [data-testid="sidebar"]');
         if (sidebar && !document.getElementById('backport-tracker-section')) {
+            const sessionId = activeSessionId;
             injectWidget(sidebar);
-            attemptAutoScan(0);
+            attemptAutoScan(0, sessionId);
         }
+    }
+
+    const observer = new MutationObserver(() => {
+        bootstrapIfNeeded();
     });
 
+    // GitHub uses SPA-style navigation; listen to history changes as well.
+    const _pushState = history.pushState;
+    history.pushState = function(...args) {
+        const ret = _pushState.apply(this, args);
+        bootstrapIfNeeded();
+        return ret;
+    };
+    const _replaceState = history.replaceState;
+    history.replaceState = function(...args) {
+        const ret = _replaceState.apply(this, args);
+        bootstrapIfNeeded();
+        return ret;
+    };
+    window.addEventListener('popstate', bootstrapIfNeeded);
+    window.addEventListener('pjax:end', bootstrapIfNeeded);
+    window.addEventListener('turbo:load', bootstrapIfNeeded);
+
     observer.observe(document.documentElement, { childList: true, subtree: true });
+    bootstrapIfNeeded();
 })();
