@@ -4,7 +4,8 @@ from __future__ import annotations
 import re
 import sys
 import time
-from typing import Optional
+from collections import deque
+from typing import Any, Optional
 
 import click
 from github import Github, GithubException
@@ -56,6 +57,14 @@ _ENTRY_RE = re.compile(
 _MD_ENTRY_RE = re.compile(
     r"^\s*-\s+\[[^\]]+\]\((?P<url>https://github\.com/\S+)\)\s*(?P<detail>.*)$",
 )
+
+
+def _short_target(url: str) -> str:
+    """Compact target label for terminal output."""
+    m = _URL_RE.search(url)
+    if not m:
+        return url
+    return f"{m.group('repo')}:{m.group('kind')}:{m.group('num')}"
 
 
 def _infer_status_from_markdown_detail(detail: str) -> str:
@@ -215,15 +224,18 @@ def _parse_summary(text: str) -> ParsedSummary:
     # --- Structured entries (legacy + markdown) ---
     entries = _collect_structured_entries(text)
 
-    # Fall back to bare URL extraction if no structured entries found.
+    # Also include bare URLs appended after a summary block.
     # Ignore metadata header lines so source_pr URLs don't become watch targets.
-    if not entries:
-        content_without_headers = "\n".join(
-            line for line in text.splitlines()
-            if not _is_metadata_line(line)
-        )
-        for url in _extract_urls(content_without_headers):
+    # For URLs already present in structured entries, keep structured status hints.
+    content_without_headers = "\n".join(
+        line for line in text.splitlines()
+        if not _is_metadata_line(line)
+    )
+    seen_urls = {e.url for e in entries}
+    for url in _extract_urls(content_without_headers):
+        if url not in seen_urls:
             entries.append(SummaryEntry("", url))
+            seen_urls.add(url)
 
     return ParsedSummary(entries, ignore_ci, metadata)
 
@@ -246,17 +258,14 @@ def _all_failures_ignored(run: WorkflowRun, ignore_ci: list[str]) -> bool:
 
 def _resolve_pr_runs(repo, pr_number: int) -> list[WorkflowRun]:
     """Return all retryable (or still in-progress) workflow runs for a PR's
-    head commit. Falls back to the single most-recent run when everything is
-    already green so the caller can at least report its status."""
+    head commit. Returns an empty list when CI is already successful so the
+    caller can skip watching this PR target."""
     pr = repo.get_pull(pr_number)
     sha = pr.head.sha
     live: list[WorkflowRun] = [
         r for r in repo.get_workflow_runs(head_sha=sha)
         if r.status != "completed" or r.conclusion in _RETRY_CONCLUSIONS
     ]
-    if not live:
-        all_runs = list(repo.get_workflow_runs(head_sha=sha))
-        live = all_runs[:1]
     return live
 
 
@@ -402,6 +411,19 @@ def auth_cmd() -> None:
         "Merged automatically with any ignore_ci encoded in the summary."
     ),
 )
+@click.option(
+    "--window-lines",
+    default=16,
+    show_default=True,
+    type=click.IntRange(6, 200),
+    help="Number of rolling log lines shown in the fixed dashboard window.",
+)
+@click.option(
+    "--rolling/--no-rolling",
+    default=True,
+    show_default=True,
+    help="Render a fixed live dashboard instead of streaming line-by-line logs.",
+)
 def run_cmd(
     targets: tuple[str, ...],
     token: str,
@@ -409,6 +431,8 @@ def run_cmd(
     max_retries: int,
     interval: int,
     ignore_ci: str,
+    window_lines: int,
+    rolling: bool,
 ) -> None:
     """Watch and auto-rerun failed GitHub Actions runs.
 
@@ -478,7 +502,7 @@ def run_cmd(
         )
 
     # --- Pre-filter entries by status hint ---
-    active_urls: list[str] = []
+    active_entries: list[SummaryEntry] = []
     for entry in parsed.entries:
         if entry.status in _SKIP_STATUSES:
             click.echo(f"  skipping [{entry.status.upper()}] {entry.url}")
@@ -487,11 +511,11 @@ def run_cmd(
                 f"  warning: [{entry.status.upper()}] {entry.url} — "
                 "CI data not yet loaded; will watch anyway"
             )
-            active_urls.append(entry.url)
+            active_entries.append(entry)
         else:
-            active_urls.append(entry.url)
+            active_entries.append(entry)
 
-    if not active_urls:
+    if not active_entries:
         click.echo("Nothing to watch — all entries were skipped.")
         return
 
@@ -499,22 +523,47 @@ def run_cmd(
     # Resolve remaining targets → WorkflowRun objects
     # -----------------------------------------------------------------------
     all_runs: list[WorkflowRun] = []
-    for t in active_urls:
+    target_state: dict[str, dict] = {}
+
+    for entry in active_entries:
+        t = entry.url
+        target_state.setdefault(
+            t,
+            {
+                "source": t,
+                "status_hint": entry.status or "unknown",
+                "run_ids": [],
+            },
+        )
         try:
             resolved = _resolve_target(t, repo_opt, g)
         except GithubException as exc:
             raise click.ClickException(f"Cannot resolve {t!r}: {_exc_message(exc)}")
+        if not resolved:
+            click.echo(f"  skipping [SUCCESS] {t} — all CI runs already passed")
+            continue
         all_runs.extend(resolved)
         for r in resolved:
+            target_state[t]["run_ids"].append(r.id)
             click.echo(f"  + {r.html_url}")
+
+    target_state = {k: v for k, v in target_state.items() if v["run_ids"]}
 
     if not all_runs:
         raise click.ClickException("No workflow runs found for the given targets.")
 
+    # Keep a fixed terminal window when interactive; in non-tty contexts,
+    # retain the previous streaming behavior.
+    use_rolling = bool(rolling and sys.stdout.isatty())
+
     click.echo(
-        f"\nWatching {len(all_runs)} run(s) | "
-        f"max-retries={max_retries} | interval={interval}s\n"
+        f"\nWatching {len(all_runs)} run(s) across {len(target_state)} target(s) | "
+        f"max-retries={max_retries} | interval={interval}s"
     )
+    if use_rolling:
+        click.echo("Live dashboard enabled. Press Ctrl-C to stop.\n")
+    else:
+        click.echo()
 
     # -----------------------------------------------------------------------
     # Per-run mutable state
@@ -525,12 +574,78 @@ def run_cmd(
             "repo_name": r.repository.full_name,
             "retries": 0,
             "done": False,
+            "result": "pending",
+            "last_status": "queued",
+            "last_conclusion": None,
         }
         for r in all_runs
     }
-    repo_cache: dict[str, object] = {}
+    repo_cache: dict[str, Any] = {}
+    run_to_target: dict[int, str] = {}
+    for t, t_state in target_state.items():
+        for run_id in t_state["run_ids"]:
+            run_to_target[run_id] = t
 
-    def _repo(name: str):
+    events: deque[str] = deque(maxlen=window_lines)
+
+    def _event(msg: str) -> None:
+        ts = time.strftime("%H:%M:%S")
+        events.append(f"[{ts}] {msg}")
+        if not use_rolling:
+            click.echo(f"  {msg}")
+
+    def _target_totals(t_url: str) -> tuple[int, int, int]:
+        run_ids = target_state[t_url]["run_ids"]
+        total = len(run_ids)
+        done = sum(1 for rid in run_ids if state[rid]["done"])
+        ok = sum(1 for rid in run_ids if state[rid]["result"] == "success")
+        return total, done, ok
+
+    def _target_label(t_url: str) -> str:
+        total, done, ok = _target_totals(t_url)
+        failed = done - ok
+        if done < total:
+            stage = "RUNNING"
+        elif failed == 0:
+            stage = "SUCCESS"
+        else:
+            stage = f"FAILED({failed})"
+        return f"{stage} | {ok}/{total} success"
+
+    def _render_dashboard() -> None:
+        click.clear()
+        click.echo("gh-rerunner live dashboard")
+        click.echo(
+            f"Targets={len(target_state)} | Runs={len(state)} | "
+            f"max-retries={max_retries} | interval={interval}s"
+        )
+        click.echo()
+        click.echo("Target totals:")
+        for t in sorted(target_state):
+            hint = target_state[t]["status_hint"].upper()
+            click.echo(f"  {_short_target(t)} [{hint}] -> {_target_label(t)}")
+
+        click.echo()
+        click.echo("Run states:")
+        for run_id in sorted(state):
+            s = state[run_id]
+            label = f"{s['repo_name']}#{run_id}"
+            live = f"{s['last_status']}/{s['last_conclusion'] or '-'}"
+            click.echo(
+                f"  {label} | {s['result']} | retries {s['retries']}/{max_retries} | {live}"
+            )
+
+        click.echo()
+        click.echo(f"Recent logs (last {window_lines}):")
+        if events:
+            for e in events:
+                click.echo(f"  {e}")
+        else:
+            click.echo("  (no events yet)")
+        click.echo()
+        click.echo("Ctrl-C to stop")
+
+    def _repo(name: str) -> Any:
         if name not in repo_cache:
             repo_cache[name] = g.get_repo(name)
         return repo_cache[name]
@@ -538,62 +653,117 @@ def run_cmd(
     # -----------------------------------------------------------------------
     # Polling loop
     # -----------------------------------------------------------------------
-    while True:
-        pending = [s for s in state.values() if not s["done"]]
-        if not pending:
-            click.echo("All runs finished.")
-            break
+    try:
+        while True:
+            pending = [s for s in state.values() if not s["done"]]
+            if not pending:
+                _event("All runs finished.")
+                break
 
-        for s in pending:
-            run_id: int = s["run"].id
-            label = f"[{s['repo_name']}#{run_id}]"
+            for s in pending:
+                run_id: int = s["run"].id
+                label = f"[{s['repo_name']}#{run_id}]"
 
-            try:
-                run: WorkflowRun = _repo(s["repo_name"]).get_workflow_run(run_id)
-                s["run"] = run
-            except GithubException as exc:
-                click.echo(f"  {label} fetch error: {_exc_message(exc)}", err=True)
-                continue
+                try:
+                    run: WorkflowRun = _repo(s["repo_name"]).get_workflow_run(run_id)
+                    s["run"] = run
+                except GithubException as exc:
+                    _event(f"{label} fetch error: {_exc_message(exc)}")
+                    continue
 
-            status, conclusion = run.status, run.conclusion
+                status, conclusion = run.status, run.conclusion
+                s["last_status"] = status
+                s["last_conclusion"] = conclusion
 
-            if status != "completed":
-                click.echo(f"  {label} {status}...")
-                continue
+                if status != "completed":
+                    continue
 
-            if conclusion in _DONE_CONCLUSIONS:
-                click.echo(f"  {label} {conclusion.upper()}")
-                s["done"] = True
-
-            elif conclusion in _RETRY_CONCLUSIONS:
-                if effective_ignore_ci and _all_failures_ignored(run, effective_ignore_ci):
-                    click.echo(
-                        f"  {label} {conclusion} — all failures are in ignored jobs, skipping rerun."
-                    )
+                if conclusion in _DONE_CONCLUSIONS:
+                    _event(f"{label} {conclusion.upper()}")
                     s["done"] = True
-                elif s["retries"] < max_retries:
-                    s["retries"] += 1
-                    click.echo(
-                        f"  {label} {conclusion} — "
-                        f"rerunning ({s['retries']}/{max_retries})..."
-                    )
-                    try:
-                        _trigger_rerun(run)
-                    except GithubException as exc:
-                        click.echo(
-                            f"  {label} rerun API error: {_exc_message(exc)}", err=True
+                    s["result"] = "success"
+
+                elif conclusion in _RETRY_CONCLUSIONS:
+                    if effective_ignore_ci and _all_failures_ignored(run, effective_ignore_ci):
+                        _event(
+                            f"{label} {conclusion} — all failures are in ignored jobs, skipping rerun."
                         )
                         s["done"] = True
+                        s["result"] = "ignored"
+                    elif s["retries"] < max_retries:
+                        s["retries"] += 1
+                        _event(
+                            f"{label} {conclusion} — rerunning ({s['retries']}/{max_retries})..."
+                        )
+                        try:
+                            _trigger_rerun(run)
+                            s["result"] = "retrying"
+                        except GithubException as exc:
+                            _event(f"{label} rerun API error: {_exc_message(exc)}")
+                            s["done"] = True
+                            s["result"] = "api_error"
+                    else:
+                        _event(
+                            f"{label} {conclusion} — max retries ({max_retries}) reached."
+                        )
+                        s["done"] = True
+                        s["result"] = "failed"
+
                 else:
-                    click.echo(
-                        f"  {label} {conclusion} — "
-                        f"max retries ({max_retries}) reached."
-                    )
+                    # cancelled, stale, etc.
+                    _event(f"{label} concluded: {conclusion} — not retrying.")
                     s["done"] = True
+                    s["result"] = "not_retryable"
 
-            else:
-                # cancelled, stale, etc.
-                click.echo(f"  {label} concluded: {conclusion} — not retrying.")
-                s["done"] = True
+            if use_rolling:
+                _render_dashboard()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        _event("Interrupted by user.")
+        if use_rolling:
+            _render_dashboard()
 
-        time.sleep(interval)
+    success_count = sum(1 for s in state.values() if s["result"] == "success")
+    failed_runs = [s for s in state.values() if s["result"] in {"failed", "api_error", "not_retryable"}]
+    click.echo()
+    click.echo(
+        f"Final summary: {success_count}/{len(state)} run(s) succeeded, "
+        f"{len(failed_runs)} need attention."
+    )
+
+    if not sys.stdout.isatty():
+        return
+
+    if failed_runs:
+        choice = click.prompt(
+            "Next action",
+            type=click.Choice(["quit", "show-failures", "retry-failed-once"], case_sensitive=False),
+            default="show-failures",
+            show_choices=True,
+        )
+        if choice == "show-failures":
+            click.echo("Runs needing attention:")
+            for s in failed_runs:
+                run = s["run"]
+                target = run_to_target.get(run.id, "")
+                click.echo(f"  - {_short_target(target)} -> {run.html_url} ({s['result']})")
+        elif choice == "retry-failed-once":
+            for s in failed_runs:
+                run = s["run"]
+                label = f"[{s['repo_name']}#{run.id}]"
+                try:
+                    _trigger_rerun(run)
+                    click.echo(f"  {label} manual rerun triggered.")
+                except GithubException as exc:
+                    click.echo(f"  {label} manual rerun failed: {_exc_message(exc)}", err=True)
+    else:
+        choice = click.prompt(
+            "All attempts succeeded. Next action",
+            type=click.Choice(["quit", "show-targets"], case_sensitive=False),
+            default="show-targets",
+            show_choices=True,
+        )
+        if choice == "show-targets":
+            click.echo("Successful targets:")
+            for t in sorted(target_state):
+                click.echo(f"  - {_short_target(t)}")

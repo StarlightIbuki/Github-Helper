@@ -95,6 +95,14 @@ gh-rerunner run [OPTIONS] [TARGETS]...
 | `-R / --repo OWNER/REPO` | — | Required for bare run IDs |
 | `-n / --max-retries N` | `3` | Max rerun attempts per run |
 | `-i / --interval SECS` | `30` | Polling interval in seconds |
+| `--window-lines N` | `16` | Rolling log window size in live dashboard |
+| `--rolling / --no-rolling` | `--rolling` | Fixed live dashboard (TTY) or streaming logs |
+
+Notes:
+
+- For PR targets, runs that are already fully successful are skipped automatically.
+- In TTY mode, `gh-rerunner run` uses a fixed dashboard window with rolling logs.
+- When all attempts finish, the CLI prompts next actions (show failures / retry once / quit).
 
 ---
 

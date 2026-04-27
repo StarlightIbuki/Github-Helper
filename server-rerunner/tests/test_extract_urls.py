@@ -258,6 +258,27 @@ class TestParseSummary:
         result = _parse_summary(text)
         assert result.ignore_ci == ["lint", "build"]
         assert len(result.entries) == 4
+
+    def test_markdown_summary_plus_appended_bare_urls(self):
+        text = bp_markdown_summary(
+            title="sample fix",
+            pr_number=100,
+            entries=[
+                ("next/1", "https://github.com/org/repo/pull/201", "CI failed"),
+                ("next/2", "https://github.com/org/repo/pull/202", "Merged"),
+            ],
+            metadata={"ignore_ci": "lint"},
+        )
+        text += "\nhttps://github.com/org/repo/pull/999\nhttps://github.com/org/repo/actions/runs/8888\n"
+
+        result = _parse_summary(text)
+        assert [e.url for e in result.entries] == [
+            "https://github.com/org/repo/pull/201",
+            "https://github.com/org/repo/pull/202",
+            "https://github.com/org/repo/pull/999",
+            "https://github.com/org/repo/actions/runs/8888",
+        ]
+        assert [e.status for e in result.entries] == ["failure", "merged", "", ""]
         merged  = [e for e in result.entries if e.status == "merged"]
         fetching = [e for e in result.entries if e.status == "fetching"]
         failure  = [e for e in result.entries if e.status == "failure"]
