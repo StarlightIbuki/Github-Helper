@@ -89,6 +89,12 @@ Version bumps in the `@version` header are what trigger the update prompt.
 
 For running CI reruns on a server without a browser, see [`server-rerunner/`](server-rerunner/) — a Python CLI that polls the GitHub API and retries failed jobs automatically.
 
+**New commands:**
+- `gh-rerunner assigned-prs` — export all assigned PRs in backport-tracker format
+- `gh-rerunner failed-logs` — fetch failed job logs with optional regex filtering and context highlighting
+
+See [`server-rerunner/README.md`](server-rerunner/README.md) for full documentation.
+
 ### Backport Tracker → gh-rerunner workflow
 
 1. Open your merged main-branch PR and let the Backport Tracker load all statuses.

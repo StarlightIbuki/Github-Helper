@@ -12,6 +12,7 @@ keywords = ["github", "actions", "ci", "rerun", "automation"]
 dependencies = [
     "PyGithub>=2.0",
     "click>=8.0",
+    "rich>=13.0",
 ]
 
 [project.optional-dependencies]

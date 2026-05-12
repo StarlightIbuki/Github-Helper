@@ -279,11 +279,11 @@ class TestParseSummary:
             "https://github.com/org/repo/actions/runs/8888",
         ]
         assert [e.status for e in result.entries] == ["failure", "merged", "", ""]
-        merged  = [e for e in result.entries if e.status == "merged"]
+        merged = [e for e in result.entries if e.status == "merged"]
         fetching = [e for e in result.entries if e.status == "fetching"]
-        failure  = [e for e in result.entries if e.status == "failure"]
-        assert len(merged) == 2
-        assert len(fetching) == 1
+        failure = [e for e in result.entries if e.status == "failure"]
+        assert len(merged) == 1
+        assert len(fetching) == 0
         assert len(failure) == 1
 
     def test_v2_metadata_headers_are_parsed(self):

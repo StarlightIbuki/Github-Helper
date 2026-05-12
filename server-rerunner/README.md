@@ -71,6 +71,58 @@ gh-rerunner auth
 
 ---
 
+### `gh-rerunner assigned-prs`
+
+Export all PRs assigned to the authenticated user in the same markdown format used by Backport Tracker.
+
+By default, this command fetches open assigned PRs only.
+
+```
+gh-rerunner assigned-prs
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-t / --token` | `$GITHUB_TOKEN` | GitHub PAT |
+| `-R / --repo OWNER/REPO` | — | Optional repository scope for the assigned-PR search |
+| `--include-closed / --open-only` | `--open-only` | Include closed assigned PRs in addition to open ones |
+| `--filter REGEX` | — | Regex filter by branch/title/url/repo |
+
+The output uses the same markdown bullet format as the backport-tracker copy summary, so you can pipe it into `gh-rerunner run` if you want to process the assigned PR URLs later.
+
+---
+
+### `gh-rerunner failed-logs`
+
+Print failed workflow jobs and their logs. Use `--grep` to keep only matching lines, plus surrounding context, and matched text is highlighted.
+
+```
+gh-rerunner failed-logs --grep 'AssertionError|Traceback' --context 3 https://github.com/owner/repo/actions/runs/12345
+```
+
+**TARGETS** can be any mix of:
+
+| Format | Example |
+|---|---|
+| Actions run URL | `https://github.com/owner/repo/actions/runs/12345` |
+| PR URL | `https://github.com/owner/repo/pull/456` |
+| Bare run ID | `12345` (requires `--repo owner/repo`) |
+
+**Options:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `-t / --token` | `$GITHUB_TOKEN` | GitHub PAT |
+| `-R / --repo OWNER/REPO` | — | Required for bare run IDs |
+| `--grep REGEX` | — | Regex filter for matching log lines |
+| `--context N` | `2` | Context lines to show around each regex match |
+
+You can pass URLs directly, or pipe the same backport-tracker summary text that `gh-rerunner run` accepts.
+
+---
+
 ### `gh-rerunner run`
 
 Watch one or more workflow runs / PRs and rerun failed jobs automatically.
@@ -97,11 +149,14 @@ gh-rerunner run [OPTIONS] [TARGETS]...
 | `-i / --interval SECS` | `30` | Polling interval in seconds |
 | `--window-lines N` | `16` | Rolling log window size in live dashboard |
 | `--rolling / --no-rolling` | `--rolling` | Fixed live dashboard (TTY) or streaming logs |
+| `--assigned / --no-assigned` | `--no-assigned` | Shortcut: fetch assigned PRs and rerun/watch them directly |
+| `--assigned-filter REGEX` | — | Regex filter used with `--assigned` |
+| `--include-closed / --open-only` | `--open-only` | In `--assigned` mode, include closed assigned PRs |
 
 Notes:
 
 - For PR targets, runs that are already fully successful are skipped automatically.
-- In TTY mode, `gh-rerunner run` uses a fixed dashboard window with rolling logs.
+- In TTY mode, `gh-rerunner run` uses an overwatch-style Rich TUI dashboard (targets, runs, and live events).
 - When all attempts finish, the CLI prompts next actions (show failures / retry once / quit).
 
 ---
@@ -109,6 +164,24 @@ Notes:
 ## Examples
 
 ```bash
+# Export assigned PRs in backport-tracker format
+gh-rerunner assigned-prs
+
+# Pipe to `run` to process the URLs
+gh-rerunner assigned-prs | gh-rerunner run -n 5
+
+# Scoped to a single repository
+gh-rerunner assigned-prs --repo owner/repo
+
+# Fetch and show failed job logs with no filtering
+gh-rerunner failed-logs https://github.com/owner/repo/actions/runs/12345
+
+# Filter logs by regex, showing context around matches
+gh-rerunner failed-logs --grep 'AssertionError|Traceback' --context 3 https://github.com/owner/repo/pull/456
+
+# Combine: pipe backport-tracker output, show only failures matching "timeout"
+pbpaste | gh-rerunner failed-logs --grep 'timeout'
+
 # Watch a single Actions run
 gh-rerunner run https://github.com/owner/repo/actions/runs/12345
 

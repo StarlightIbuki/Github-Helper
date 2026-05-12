@@ -1,15 +1,38 @@
 """Core CLI and polling logic for gh-rerunner."""
 from __future__ import annotations
 
+import io
+import importlib
 import re
 import sys
 import time
+import urllib.error
+import urllib.request
+import zipfile
 from collections import deque
 from typing import Any, Optional
 
 import click
 from github import Github, GithubException
 from github.WorkflowRun import WorkflowRun
+
+try:
+    _rich_console = importlib.import_module("rich.console")
+    _rich_live = importlib.import_module("rich.live")
+    _rich_panel = importlib.import_module("rich.panel")
+    _rich_table = importlib.import_module("rich.table")
+
+    _RichGroup = getattr(_rich_console, "Group", None)
+    _RichLive = getattr(_rich_live, "Live", None)
+    _RichPanel = getattr(_rich_panel, "Panel", None)
+    _RichTable = getattr(_rich_table, "Table", None)
+    _RICH_AVAILABLE = all(x is not None for x in (_RichGroup, _RichLive, _RichPanel, _RichTable))
+except Exception:
+    _RichGroup = None
+    _RichLive = None
+    _RichPanel = None
+    _RichTable = None
+    _RICH_AVAILABLE = False
 
 # Matches GitHub PR and Actions run URLs
 _URL_RE = re.compile(
@@ -162,6 +185,217 @@ def _collect_structured_entries(text: str) -> list[SummaryEntry]:
         status, url = parsed
         _append_entry(entries, seen, status, url)
     return entries
+
+
+def _format_markdown_summary(
+    title: str,
+    entries: list[tuple[str, str, str]],
+    metadata: dict[str, str] | None = None,
+) -> str:
+    lines = [f"# {title}"]
+    meta = {"format": "2"}
+    if metadata:
+        meta.update(metadata)
+    attrs = " ".join(f'{key}="{value}"' for key, value in meta.items())
+    lines.append(f"<!-- gh-rerunner: {attrs} -->")
+    lines.extend(f"- [{branch}]({url}) {detail}" for branch, url, detail in entries)
+    return "\n".join(lines)
+
+
+def _pick_pr_status(repo, pr) -> str:
+    if getattr(pr, "merged", False) or getattr(pr, "merged_at", None):
+        return "Merged"
+    if getattr(pr, "state", "").lower() == "closed":
+        return "Closed"
+
+    try:
+        runs = list(repo.get_workflow_runs(head_sha=pr.head.sha))
+    except GithubException:
+        return "CI unavailable"
+
+    if not runs:
+        return "CI unavailable"
+
+    has_pending = False
+    has_failure = False
+    has_success = False
+    for run in runs:
+        if run.status != "completed":
+            has_pending = True
+            continue
+        conclusion = (run.conclusion or "").lower()
+        if conclusion in _RETRY_CONCLUSIONS:
+            has_failure = True
+        elif conclusion in _DONE_CONCLUSIONS:
+            has_success = True
+        else:
+            has_pending = True
+
+    if has_failure:
+        return "CI failed"
+    if has_pending:
+        return "CI pending"
+    if has_success:
+        return "CI passed"
+    return "CI unavailable"
+
+
+def _collect_assigned_pr_entries(
+    g: Github,
+    repo_opt: Optional[str] = None,
+    include_closed: bool = False,
+    filter_pattern: Optional[str] = None,
+) -> tuple[str, list[tuple[str, str, str]], dict[str, str]]:
+    login = g.get_user().login
+    metadata: dict[str, str] = {"source": "assigned-prs", "assignee": login}
+    if repo_opt:
+        metadata["repo"] = repo_opt
+    metadata["scope"] = "open+closed" if include_closed else "open"
+
+    filter_re = _compile_regex(filter_pattern)
+
+    queries = [f"is:pr assignee:{login} is:open"]
+    if include_closed:
+        queries.append(f"is:pr assignee:{login} is:closed")
+    if repo_opt:
+        queries = [f"repo:{repo_opt} {query}" for query in queries]
+
+    seen_urls: set[str] = set()
+    entries: list[tuple[str, str, str]] = []
+    for query_index, query in enumerate(queries, 1):
+        state = "open" if "is:open" in query else "closed"
+        click.echo(f"  Fetching {state} assigned PRs...", err=True)
+        count = 0
+        for issue in g.search_issues(query=query, sort="updated", order="desc"):
+            if not getattr(issue, "pull_request", None):
+                continue
+            url = issue.html_url
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            count += 1
+            click.echo(f"    Found PR #{issue.number} — checking CI status...", err=True)
+
+            detail = "CI unavailable"
+            branch = getattr(issue, "title", "PR")
+            try:
+                repo = g.get_repo(issue.repository.full_name)
+                pr = repo.get_pull(issue.number)
+                branch = pr.head.ref or branch
+                detail = _pick_pr_status(repo, pr)
+            except GithubException:
+                pass
+
+            if filter_re and not (
+                filter_re.search(branch)
+                or filter_re.search(url)
+                or filter_re.search(getattr(issue, "title", ""))
+                or filter_re.search(getattr(issue.repository, "full_name", ""))
+            ):
+                continue
+
+            entries.append((branch, url, detail))
+
+        if count == 0:
+            click.echo(f"    (no {state} assigned PRs found)", err=True)
+        else:
+            click.echo(f"    {count} {state} assigned PR(s) processed", err=True)
+
+    title = f"Assigned PRs for @{login}"
+    return title, entries, metadata
+
+
+def _download_binary(url: str, token: str) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "gh-rerunner",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise click.ClickException(f"Failed to fetch logs from {url}: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise click.ClickException(f"Failed to fetch logs from {url}: {exc.reason}") from exc
+
+
+def _decode_log_archive(blob: bytes) -> list[tuple[str, str]]:
+    if blob[:2] == b"PK":
+        entries: list[tuple[str, str]] = []
+        with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+            for name in archive.namelist():
+                if name.endswith("/"):
+                    continue
+                with archive.open(name) as handle:
+                    entries.append((name, handle.read().decode("utf-8", errors="replace")))
+        return entries
+    return [("workflow.log", blob.decode("utf-8", errors="replace"))]
+
+
+def _compile_regex(pattern: Optional[str]) -> Optional[re.Pattern[str]]:
+    if not pattern:
+        return None
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        raise click.BadParameter(f"invalid regex: {exc}") from exc
+
+
+def _highlight_pattern(text: str, pattern: Optional[re.Pattern[str]]) -> str:
+    if not pattern:
+        return text
+    return pattern.sub(lambda match: click.style(match.group(0), fg="yellow", bold=True), text)
+
+
+def _render_context_lines(
+    text: str,
+    pattern: Optional[re.Pattern[str]],
+    context: int,
+) -> list[str]:
+    lines = text.splitlines()
+    if not lines:
+        return []
+    if pattern is None:
+        return [f"{index + 1:>5} | {_highlight_pattern(line, pattern)}" for index, line in enumerate(lines)]
+
+    match_indexes = [index for index, line in enumerate(lines) if pattern.search(line)]
+    if not match_indexes:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    start = max(0, match_indexes[0] - context)
+    end = min(len(lines) - 1, match_indexes[0] + context)
+    for index in match_indexes[1:]:
+        next_start = max(0, index - context)
+        next_end = min(len(lines) - 1, index + context)
+        if next_start <= end + 1:
+            end = max(end, next_end)
+        else:
+            ranges.append((start, end))
+            start, end = next_start, next_end
+    ranges.append((start, end))
+
+    rendered: list[str] = []
+    for range_index, (start, end) in enumerate(ranges):
+        if range_index > 0:
+            rendered.append("    ...")
+        for index in range(start, end + 1):
+            prefix = ">" if pattern.search(lines[index]) else " "
+            rendered.append(
+                f"{prefix}{index + 1:>5} | {_highlight_pattern(lines[index], pattern)}"
+            )
+    return rendered
+
+
+def _collect_failed_jobs(run: WorkflowRun) -> list[Any]:
+    return [
+        job for job in run.jobs()
+        if (job.conclusion or "").lower() in _RETRY_CONCLUSIONS
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +606,60 @@ def auth_cmd() -> None:
 
 
 # ---------------------------------------------------------------------------
+# assigned-prs subcommand
+# ---------------------------------------------------------------------------
+
+@main.command("assigned-prs")
+@click.option(
+    "--token", "-t",
+    envvar="GITHUB_TOKEN",
+    required=True,
+    help="GitHub personal access token. Falls back to $GITHUB_TOKEN.",
+)
+@click.option(
+    "--repo", "-R", "repo_opt",
+    default=None,
+    metavar="OWNER/REPO",
+    help="Optional repository scope for assigned PR lookup.",
+)
+@click.option(
+    "--include-closed/--open-only",
+    default=False,
+    show_default=True,
+    help="Include closed assigned PRs in addition to open ones.",
+)
+@click.option(
+    "--filter", "filter_pattern",
+    default=None,
+    metavar="REGEX",
+    help="Optional regex to filter assigned PRs by branch/title/url/repo.",
+)
+def assigned_prs_cmd(
+    token: str,
+    repo_opt: Optional[str],
+    include_closed: bool,
+    filter_pattern: Optional[str],
+) -> None:
+    """Export assigned PRs in the same markdown format used by backport-tracker."""
+    g = Github(token)
+    click.echo("Fetching assigned PRs...", err=True)
+    title, entries, metadata = _collect_assigned_pr_entries(
+        g,
+        repo_opt=repo_opt,
+        include_closed=include_closed,
+        filter_pattern=filter_pattern,
+    )
+    click.echo(f"Found {len(entries)} assigned PR(s)", err=True)
+    if not entries:
+        click.echo(f"# {title}")
+        click.echo(f"<!-- gh-rerunner: format=\"2\" source=\"assigned-prs\" assignee=\"{g.get_user().login}\" -->")
+        click.echo("No assigned PRs found.")
+        return
+    click.echo(f"Exporting to markdown...", err=True)
+    click.echo(_format_markdown_summary(title, entries, metadata))
+
+
+# ---------------------------------------------------------------------------
 # run subcommand
 # ---------------------------------------------------------------------------
 
@@ -424,6 +712,24 @@ def auth_cmd() -> None:
     show_default=True,
     help="Render a fixed live dashboard instead of streaming line-by-line logs.",
 )
+@click.option(
+    "--assigned/--no-assigned",
+    default=False,
+    show_default=True,
+    help="Shortcut: fetch assigned PRs and watch/rerun their workflow runs.",
+)
+@click.option(
+    "--assigned-filter",
+    default=None,
+    metavar="REGEX",
+    help="Regex filter for --assigned mode (branch/title/url/repo).",
+)
+@click.option(
+    "--include-closed/--open-only",
+    default=False,
+    show_default=True,
+    help="In --assigned mode, include closed assigned PRs (default: open only).",
+)
 def run_cmd(
     targets: tuple[str, ...],
     token: str,
@@ -433,6 +739,9 @@ def run_cmd(
     ignore_ci: str,
     window_lines: int,
     rolling: bool,
+    assigned: bool,
+    assigned_filter: Optional[str],
+    include_closed: bool,
 ) -> None:
     """Watch and auto-rerun failed GitHub Actions runs.
 
@@ -468,6 +777,27 @@ def run_cmd(
 
     if targets:
         raw_text_parts.append("\n".join(targets))
+
+    if assigned:
+        if targets:
+            raise click.UsageError("Do not pass explicit TARGETS together with --assigned.")
+        click.echo("Collecting assigned PRs for run shortcut...", err=True)
+        assigned_title, assigned_entries, assigned_metadata = _collect_assigned_pr_entries(
+            g,
+            repo_opt=repo_opt,
+            include_closed=include_closed,
+            filter_pattern=assigned_filter,
+        )
+        if not assigned_entries:
+            click.echo("No assigned PRs matched -- nothing to watch.")
+            return
+        click.echo(
+            f"Using {len(assigned_entries)} assigned PR(s) from '{assigned_title}'.",
+            err=True,
+        )
+        raw_text_parts.append(
+            _format_markdown_summary(assigned_title, assigned_entries, assigned_metadata)
+        )
 
     # Interactive fallback
     if not raw_text_parts and sys.stdout.isatty():
@@ -555,13 +885,18 @@ def run_cmd(
     # Keep a fixed terminal window when interactive; in non-tty contexts,
     # retain the previous streaming behavior.
     use_rolling = bool(rolling and sys.stdout.isatty())
+    use_rich_tui = bool(use_rolling and _RICH_AVAILABLE)
 
     click.echo(
         f"\nWatching {len(all_runs)} run(s) across {len(target_state)} target(s) | "
         f"max-retries={max_retries} | interval={interval}s"
     )
-    if use_rolling:
+    if use_rich_tui:
+        click.echo("Rich overwatch dashboard enabled. Press Ctrl-C to stop.\n")
+    elif use_rolling:
         click.echo("Live dashboard enabled. Press Ctrl-C to stop.\n")
+        if not _RICH_AVAILABLE:
+            click.echo("Tip: install 'rich' for an enhanced TUI dashboard.")
     else:
         click.echo()
 
@@ -645,6 +980,54 @@ def run_cmd(
         click.echo()
         click.echo("Ctrl-C to stop")
 
+    def _build_rich_dashboard() -> Any:
+        if not _RICH_AVAILABLE or _RichTable is None or _RichPanel is None or _RichGroup is None:
+            return "Rich TUI unavailable"
+
+        header = (
+            f"Targets={len(target_state)} | Runs={len(state)} | "
+            f"max-retries={max_retries} | interval={interval}s"
+        )
+
+        target_table = _RichTable(title="Target Totals", expand=True)
+        target_table.add_column("Target", style="cyan", overflow="fold")
+        target_table.add_column("Hint", style="magenta")
+        target_table.add_column("State", style="green")
+        for t in sorted(target_state):
+            hint = target_state[t]["status_hint"].upper()
+            target_table.add_row(_short_target(t), hint, _target_label(t))
+
+        run_table = _RichTable(title="Run States", expand=True)
+        run_table.add_column("Run", style="cyan", overflow="fold")
+        run_table.add_column("Result", style="green")
+        run_table.add_column("Retries", style="yellow")
+        run_table.add_column("Live", style="magenta")
+        for run_id in sorted(state):
+            s = state[run_id]
+            label = f"{s['repo_name']}#{run_id}"
+            live = f"{s['last_status']}/{s['last_conclusion'] or '-'}"
+            run_table.add_row(
+                label,
+                str(s["result"]),
+                f"{s['retries']}/{max_retries}",
+                live,
+            )
+
+        logs_table = _RichTable(title=f"Recent Logs (last {window_lines})", expand=True)
+        logs_table.add_column("Event", overflow="fold")
+        if events:
+            for event in events:
+                logs_table.add_row(event)
+        else:
+            logs_table.add_row("(no events yet)")
+
+        return _RichGroup(
+            _RichPanel(header, title="gh-rerunner overwatch", border_style="blue"),
+            target_table,
+            run_table,
+            logs_table,
+        )
+
     def _repo(name: str) -> Any:
         if name not in repo_cache:
             repo_cache[name] = g.get_repo(name)
@@ -653,7 +1036,14 @@ def run_cmd(
     # -----------------------------------------------------------------------
     # Polling loop
     # -----------------------------------------------------------------------
+    live_obj: Any = None
     try:
+        if use_rich_tui:
+            if _RichLive is None:
+                raise click.ClickException("Rich TUI requested but rich is not available.")
+            live_obj = _RichLive(_build_rich_dashboard(), refresh_per_second=4)
+            live_obj.start()
+
         while True:
             pending = [s for s in state.values() if not s["done"]]
             if not pending:
@@ -715,13 +1105,20 @@ def run_cmd(
                     s["done"] = True
                     s["result"] = "not_retryable"
 
-            if use_rolling:
+            if use_rich_tui and live_obj is not None:
+                live_obj.update(_build_rich_dashboard())
+            elif use_rolling:
                 _render_dashboard()
             time.sleep(interval)
     except KeyboardInterrupt:
         _event("Interrupted by user.")
-        if use_rolling:
+        if use_rich_tui and live_obj is not None:
+            live_obj.update(_build_rich_dashboard())
+        elif use_rolling:
             _render_dashboard()
+    finally:
+        if live_obj is not None:
+            live_obj.stop()
 
     success_count = sum(1 for s in state.values() if s["result"] == "success")
     failed_runs = [s for s in state.values() if s["result"] in {"failed", "api_error", "not_retryable"}]
@@ -767,3 +1164,127 @@ def run_cmd(
             click.echo("Successful targets:")
             for t in sorted(target_state):
                 click.echo(f"  - {_short_target(t)}")
+
+
+# ---------------------------------------------------------------------------
+# failed-logs subcommand
+# ---------------------------------------------------------------------------
+
+@main.command("failed-logs")
+@click.argument("targets", nargs=-1, metavar="[TARGETS]...")
+@click.option(
+    "--token", "-t",
+    envvar="GITHUB_TOKEN",
+    required=True,
+    help="GitHub personal access token. Falls back to $GITHUB_TOKEN.",
+)
+@click.option(
+    "--repo", "-R", "repo_opt",
+    default=None,
+    metavar="OWNER/REPO",
+    help="Repository in owner/repo format. Required for bare run IDs.",
+)
+@click.option(
+    "--grep", "grep_pattern",
+    default=None,
+    metavar="REGEX",
+    help="Only print log lines matching REGEX, plus adjacent context lines.",
+)
+@click.option(
+    "--context",
+    default=2,
+    show_default=True,
+    type=click.IntRange(0, 50),
+    help="Number of adjacent lines to show around each regex match.",
+)
+def failed_logs_cmd(
+    targets: tuple[str, ...],
+    token: str,
+    repo_opt: Optional[str],
+    grep_pattern: Optional[str],
+    context: int,
+) -> None:
+    """Print failed workflow jobs and their logs, filtered by an optional regex."""
+    g = Github(token)
+
+    raw_text_parts: list[str] = []
+
+    if not sys.stdin.isatty():
+        raw_text_parts.append(sys.stdin.read())
+
+    if targets:
+        raw_text_parts.append("\n".join(targets))
+
+    if not raw_text_parts and sys.stdout.isatty():
+        click.echo(
+            "Paste PR/run URLs or a backport-tracker summary, one per line.\n"
+            "Empty line or Ctrl-D to start:"
+        )
+        lines: list[str] = []
+        while True:
+            try:
+                line = input("> ").strip()
+            except EOFError:
+                click.echo()
+                break
+            if not line:
+                break
+            lines.append(line)
+        raw_text_parts.append("\n".join(lines))
+
+    combined = "\n".join(raw_text_parts)
+    parsed = _parse_summary(combined)
+
+    if not parsed.entries:
+        raise click.UsageError(
+            "No targets found. Pass URLs / run IDs, or pipe backport-tracker output."
+        )
+
+    pattern = _compile_regex(grep_pattern)
+    any_failed_jobs = False
+
+    click.echo(f"Resolving targets...", err=True)
+    for entry in parsed.entries:
+        try:
+            resolved = _resolve_target(entry.url, repo_opt, g)
+        except GithubException as exc:
+            raise click.ClickException(f"Cannot resolve {entry.url!r}: {_exc_message(exc)}")
+
+        for run in resolved:
+            click.echo(f"Fetching failed jobs from {_short_target(run.html_url)}...", err=True)
+            failed_jobs = _collect_failed_jobs(run)
+            if not failed_jobs:
+                click.echo(f"{_short_target(run.html_url)}: no failed jobs found")
+                continue
+
+            any_failed_jobs = True
+            click.echo(f"{_short_target(run.html_url)}")
+
+            for job_index, job in enumerate(failed_jobs, 1):
+                click.echo(f"  job: {job.name} ({job.conclusion})")
+
+                failed_steps = [
+                    step for step in (job.steps or [])
+                    if (step.conclusion or "").lower() in _RETRY_CONCLUSIONS
+                ]
+                if failed_steps:
+                    click.echo("    failed steps:")
+                    for step in failed_steps:
+                        click.echo(f"      - {step.name} ({step.conclusion})")
+                else:
+                    click.echo("    failed steps: (none reported by API)")
+
+                click.echo(f"    Downloading logs ({job_index}/{len(failed_jobs)})...", err=True)
+                blob = _download_binary(job.logs_url, token)
+                click.echo(f"    Parsing logs...", err=True)
+                for file_name, log_text in _decode_log_archive(blob):
+                    click.echo(f"    log: {file_name}")
+                    rendered = _render_context_lines(log_text, pattern, context)
+                    if pattern and not rendered:
+                        click.echo("      (no matching lines)")
+                        continue
+                    for line in rendered:
+                        click.echo(f"      {line}")
+
+    if not any_failed_jobs:
+        click.echo("No failed jobs found in the requested targets.")
