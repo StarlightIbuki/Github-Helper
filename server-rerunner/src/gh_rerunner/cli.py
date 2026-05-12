@@ -34,17 +34,20 @@ try:
     _rich_live = importlib.import_module("rich.live")
     _rich_panel = importlib.import_module("rich.panel")
     _rich_table = importlib.import_module("rich.table")
+    _rich_text = importlib.import_module("rich.text")
 
     _RichGroup = getattr(_rich_console, "Group", None)
     _RichLive = getattr(_rich_live, "Live", None)
     _RichPanel = getattr(_rich_panel, "Panel", None)
     _RichTable = getattr(_rich_table, "Table", None)
+    _RichText = getattr(_rich_text, "Text", None)
     _RICH_AVAILABLE = all(x is not None for x in (_RichGroup, _RichLive, _RichPanel, _RichTable))
 except Exception:
     _RichGroup = None
     _RichLive = None
     _RichPanel = None
     _RichTable = None
+    _RichText = None
     _RICH_AVAILABLE = False
 
 # Matches GitHub PR and Actions run URLs
@@ -95,16 +98,28 @@ _MD_ENTRY_RE = re.compile(
 )
 
 _CONVENTIONAL_TITLE_PREFIX_RE = re.compile(
-    r"^[a-zA-Z][a-zA-Z0-9_-]*(?:\([^)]+\))?(?:!)?:\s+"
+    r"^(?:\[[^\]]+\]\s+)?[a-zA-Z][a-zA-Z0-9_-]*(?:\([^)]+\))?(?:!)?:\s+"
 )
 
 _BACKPORT_TARGET_RE = re.compile(
     r"(?i)\b(?:backport|cherry[- ]pick)(?:\s+to)?[\s:/_-]+(?P<branch>[A-Za-z0-9._/-]+)"
 )
 
+# Mergify/bors bp/ style head refs:  bp/release-3.11/pr-15111  or  mergify/bp/release-3.11/pr-15111
+_BACKPORT_BP_REF_RE = re.compile(
+    r"(?:^|/)bp/(?P<branch>[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*)/pr-\d+$"
+)
+
+# Matches the source PR number in a backport PR description, e.g. "Backport of #15111"
+_BACKPORT_SOURCE_PR_RE = re.compile(
+    r"(?i)(?:backport|cherry[- ]pick)\b[^#\n]{0,60}#(\d+)"
+)
+
 _CONFIG_PATH = Path.home() / ".gh-rerunner.json"
 _PR_STATUS_CACHE_PATH = Path.home() / ".gh-rerunner-cache.json"
-_PR_STATUS_CACHE_TTL_SECONDS = 300
+_PR_STATUS_CACHE_TTL_SECONDS = 3600  # 1 hour
+_SESSION_PATH = Path.home() / ".gh-rerunner-sessions.json"
+_MAX_SESSIONS = 20
 _DEFAULT_REPO_CONFIG = {
     "ignore_ci": [],
     "required_labels": [],
@@ -146,6 +161,7 @@ def _clean_pr_title(title: str) -> str:
 
 
 def _extract_backport_target_branch(title: str, head_ref: str) -> str:
+    # Try explicit backport/cherry-pick keyword in title or head ref
     for source in (title, head_ref):
         if not source:
             continue
@@ -158,6 +174,11 @@ def _extract_backport_target_branch(title: str, head_ref: str) -> str:
                 return to_match.group("branch")
             return branch
 
+    # Mergify / bors  bp/<branch>/pr-<num>  style
+    bp_match = _BACKPORT_BP_REF_RE.search(head_ref)
+    if bp_match:
+        return bp_match.group("branch")
+
     ref = head_ref.lower()
     if "backport" in ref:
         match = re.search(r"(?:to|into|for)[-_](?P<branch>[A-Za-z0-9._/-]+)", head_ref)
@@ -166,7 +187,20 @@ def _extract_backport_target_branch(title: str, head_ref: str) -> str:
     return ""
 
 
-def _build_pr_display_meta(title: str, head_ref: str) -> dict[str, Any]:
+def _extract_backport_source_pr(body: str) -> int:
+    """Return the source PR number mentioned in a backport PR description, or 0 if not found."""
+    if not body:
+        return 0
+    m = _BACKPORT_SOURCE_PR_RE.search(body)
+    if m:
+        try:
+            return int(m.group(1))
+        except (ValueError, IndexError):
+            return 0
+    return 0
+
+
+def _build_pr_display_meta(title: str, head_ref: str, body: str = "") -> dict[str, Any]:
     cleaned = _clean_pr_title(title) or title.strip()
     backport_target = _extract_backport_target_branch(title, head_ref)
     lowered = f"{title} {head_ref}".lower()
@@ -176,11 +210,14 @@ def _build_pr_display_meta(title: str, head_ref: str) -> dict[str, Any]:
     if is_backport:
         base_title = re.sub(r"(?i)\bbackport\b", "", cleaned).strip(" -:_") or cleaned
 
+    source_pr = _extract_backport_source_pr(body) if is_backport else 0
+
     return {
         "pr_title": cleaned,
         "pr_base_title": base_title,
         "is_backport": is_backport,
         "backport_target": backport_target,
+        "backport_source_pr": source_pr,
     }
 
 
@@ -272,14 +309,19 @@ def _get_cached_pr_status(
     ts = raw.get("ts")
     if not isinstance(ts, (int, float)):
         return None
-    if time.time() - float(ts) > ttl_seconds:
+    # Skip TTL check for merged PRs—they don't change
+    is_merged = bool(raw.get("is_merged", False))
+    if not is_merged and time.time() - float(ts) > ttl_seconds:
         return None
     branch = raw.get("branch")
     detail = raw.get("detail")
     title = raw.get("title", "")
     if not isinstance(branch, str) or not isinstance(detail, str) or not isinstance(title, str):
         return None
-    return {"branch": branch, "detail": detail, "title": title}
+    source_pr = raw.get("source_pr", 0)
+    if not isinstance(source_pr, int):
+        source_pr = 0
+    return {"branch": branch, "detail": detail, "title": title, "source_pr": source_pr}
 
 
 def _set_cached_pr_status(
@@ -289,6 +331,8 @@ def _set_cached_pr_status(
     branch: str,
     detail: str,
     title: str,
+    source_pr: int = 0,
+    is_merged: bool = False,
 ) -> None:
     prs = cache_data.setdefault("prs", {})
     if not isinstance(prs, dict):
@@ -299,7 +343,58 @@ def _set_cached_pr_status(
         "branch": branch,
         "detail": detail,
         "title": title,
+        "source_pr": source_pr,
+        "is_merged": is_merged,
     }
+
+
+# ---------------------------------------------------------------------------
+# Session persistence
+# ---------------------------------------------------------------------------
+
+def _load_sessions() -> list[dict[str, Any]]:
+    """Load saved sessions list from disk. Returns [] on error."""
+    try:
+        data = json.loads(_SESSION_PATH.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+    return []
+
+
+def _save_session(raw_text: str, metadata: dict[str, str]) -> int:
+    """Append a new session entry (raw summary text + metadata) and return its 1-based index."""
+    sessions = _load_sessions()
+    entry = {
+        "ts": time.time(),
+        "ts_human": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "raw": raw_text,
+        "metadata": metadata,
+    }
+    sessions.append(entry)
+    # Keep only the last N sessions
+    if len(sessions) > _MAX_SESSIONS:
+        sessions = sessions[-_MAX_SESSIONS:]
+    _SESSION_PATH.write_text(json.dumps(sessions, indent=2) + "\n", encoding="utf-8")
+    return len(sessions)
+
+
+def _resolve_session_ref(ref: str) -> Optional[str]:
+    """Resolve a session reference (#last, #N) to the stored raw text."""
+    sessions = _load_sessions()
+    if not sessions:
+        return None
+    ref = ref.lstrip("#").strip().lower()
+    if ref == "last":
+        return str(sessions[-1]["raw"])
+    try:
+        idx = int(ref)
+        if 1 <= idx <= len(sessions):
+            return str(sessions[idx - 1]["raw"])
+    except (ValueError, IndexError):
+        pass
+    return None
 
 
 def _repo_config(data: dict[str, Any], repo: str) -> dict[str, Any]:
@@ -513,25 +608,33 @@ def _collect_assigned_pr_entries(
                 continue
             seen_urls.add(url)
             count += 1
-            click.echo(f"    Found PR #{issue.number} — checking CI status...", err=True)
 
             detail = "CI unavailable"
             branch = getattr(issue, "title", "PR")
             title = str(getattr(issue, "title", "") or "").strip()
-            repo_full_name = str(getattr(issue.repository, "full_name", ""))
+
+            # Extract repo full name from the URL to avoid a lazy-loaded API
+            # call on issue.repository (which costs 1 request per PR).
+            url_m = _URL_RE.search(url)
+            repo_full_name = url_m.group("repo") if url_m else str(getattr(issue.repository, "full_name", ""))
 
             cached = _get_cached_pr_status(pr_status_cache, repo_full_name, issue.number)
             if cached is not None:
                 branch = cached["branch"] or branch
                 detail = cached["detail"] or detail
                 title = cached["title"] or title
+                click.echo(f"    PR #{issue.number} — using cached status", err=True)
             else:
+                click.echo(f"    PR #{issue.number} — fetching CI status...", err=True)
                 try:
                     repo = g.get_repo(repo_full_name)
                     pr = repo.get_pull(issue.number)
                     branch = pr.head.ref or branch
                     detail = _pick_pr_status(repo, pr)
                     title = str(getattr(pr, "title", "") or title).strip()
+                    body = str(getattr(pr, "body", "") or "")
+                    source_pr = _extract_backport_source_pr(body)
+                    is_merged = bool(getattr(pr, "merged", False))
                     _set_cached_pr_status(
                         pr_status_cache,
                         repo_full_name,
@@ -539,6 +642,8 @@ def _collect_assigned_pr_entries(
                         branch,
                         detail,
                         title,
+                        source_pr=source_pr,
+                        is_merged=is_merged,
                     )
                     cache_changed = True
                 except GithubException:
@@ -562,6 +667,7 @@ def _collect_assigned_pr_entries(
     title = f"Assigned PRs for @{login}"
     if cache_changed:
         _save_pr_status_cache(pr_status_cache)
+        click.echo(f"    cache: saved to {_PR_STATUS_CACHE_PATH}", err=True)
     return title, entries, metadata
 
 
@@ -1093,6 +1199,8 @@ def run_cmd(
       gh-rerunner run -t ghp_xxx        (interactive: paste URLs, empty line to start)
       pbpaste | gh-rerunner run
       cat summary.txt | gh-rerunner run -n 5 -i 60
+      gh-rerunner run #last             (resume most recent session)
+      gh-rerunner run #3                (resume session #3)
     """
     g = Github(token)
     user_cfg = _load_user_config()
@@ -1105,7 +1213,21 @@ def run_cmd(
     if not sys.stdin.isatty():
         raw_text_parts.append(sys.stdin.read())
 
-    if targets:
+    # Check for session reference: a single arg like #last or #3
+    session_resume = False
+    if targets and len(targets) == 1 and targets[0].startswith("#"):
+        resolved = _resolve_session_ref(targets[0])
+        if resolved is None:
+            sessions = _load_sessions()
+            raise click.UsageError(
+                f"No session found for {targets[0]!r}. "
+                f"Available: #last or #1..#{len(sessions)}" if sessions else
+                f"No saved sessions found."
+            )
+        click.echo(f"Resuming session {targets[0]!r}...", err=True)
+        raw_text_parts.append(resolved)
+        session_resume = True
+    elif targets:
         raw_text_parts.append("\n".join(targets))
 
     if assigned:
@@ -1148,6 +1270,12 @@ def run_cmd(
         raw_text_parts.append("\n".join(lines))
 
     combined = "\n".join(raw_text_parts)
+
+    # Save this as a new session (unless we are already resuming one)
+    if not session_resume and combined.strip():
+        session_idx = _save_session(combined, {})
+        click.echo(f"  Session #{session_idx} saved — resume with: gh-rerunner run #{session_idx}", err=True)
+
     parsed = _parse_summary(combined)
 
     # Merge ignore_ci from CLI option + summary header
@@ -1200,6 +1328,7 @@ def run_cmd(
                 "pr_base_title": "",
                 "is_backport": False,
                 "backport_target": "",
+                "backport_source_pr": 0,
             },
         )
 
@@ -1222,16 +1351,21 @@ def run_cmd(
         if pr_num is not None and repo_name:
             cached = _get_cached_pr_status(pr_status_cache, repo_name, pr_num)
             if cached is not None and cached.get("title"):
+                click.echo(f"  {_short_target(t)} — using cached PR metadata", err=True)
                 meta = _build_pr_display_meta(cached.get("title", ""), cached.get("branch", ""))
+                meta["backport_source_pr"] = int(cached.get("source_pr") or 0)
                 target_state[t].update(meta)
             else:
+                click.echo(f"  {_short_target(t)} — fetching PR metadata...", err=True)
                 try:
                     if pr_obj is None:
                         pr_obj = g.get_repo(repo_name).get_pull(pr_num)
                     title = str(getattr(pr_obj, "title", "")).strip()
                     branch = str(getattr(getattr(pr_obj, "head", None), "ref", "") or "")
-                    meta = _build_pr_display_meta(title, branch)
+                    body = str(getattr(pr_obj, "body", "") or "")
+                    meta = _build_pr_display_meta(title, branch, body)
                     target_state[t].update(meta)
+                    is_merged = bool(getattr(pr_obj, "merged", False))
                     _set_cached_pr_status(
                         pr_status_cache,
                         repo_name,
@@ -1239,6 +1373,8 @@ def run_cmd(
                         branch=branch,
                         detail=str(entry.status or "unknown"),
                         title=title,
+                        source_pr=meta.get("backport_source_pr", 0),
+                        is_merged=is_merged,
                     )
                     pr_cache_changed = True
                 except GithubException:
@@ -1267,6 +1403,7 @@ def run_cmd(
 
     if pr_cache_changed:
         _save_pr_status_cache(pr_status_cache)
+        click.echo(f"  cache: saved to {_PR_STATUS_CACHE_PATH}", err=True)
 
     # Keep a fixed terminal window when interactive; in non-tty contexts,
     # retain the previous streaming behavior.
@@ -1339,15 +1476,41 @@ def run_cmd(
             stage = "SUCCESS"
         else:
             stage = f"FAILED({failed})"
-        return f"{stage} | {ok}/{total} success"
+        return f"{stage}\n{ok}/{total} ok"
 
     def _target_title_subtitle(t_url: str) -> str:
+        """Plain-text subtitle for rolling/click output."""
         t_state = target_state.get(t_url, {})
-        base = str(t_state.get("pr_title", "")).strip() or "PR title unavailable"
+        base = str(t_state.get("pr_title", "")).strip()
         if t_state.get("is_backport"):
             branch = str(t_state.get("backport_target", "")).strip() or "unknown"
-            return f"*BP* {base} -> {branch}"
-        return base
+            source = int(t_state.get("backport_source_pr") or 0)
+            source_part = f"#{source} " if source else ""
+            suffix = f"  \u21c6 backport {source_part}\u2192 {branch}"
+            return f"{base}{suffix}" if base else suffix.strip()
+        return base or "PR title unavailable"
+
+    def _target_rich_cell(t_url: str, prefix: str) -> Any:
+        """Build a Rich Text cell for the target table row."""
+        t_state = target_state.get(t_url, {})
+        short = _short_target(t_url)
+        if _RichText is None:
+            # Fallback: plain string
+            return f"{prefix} {short}\n  {_target_title_subtitle(t_url)}"
+        cell = _RichText()
+        cell.append(f"{prefix} {short}")
+        base = str(t_state.get("pr_title", "")).strip()
+        if t_state.get("is_backport"):
+            branch = str(t_state.get("backport_target", "")).strip() or "unknown"
+            source = int(t_state.get("backport_source_pr") or 0)
+            source_part = f"#{source} " if source else ""
+            cell.append(f"  \u21c6 backport {source_part}\u2192 {branch}", style="dim yellow")
+            if base:
+                cell.append(f"\n  {base}", style="dim")
+        else:
+            if base:
+                cell.append(f"\n  {base}", style="dim")
+        return cell
 
     def _sorted_target_items() -> list[str]:
         return sorted(
@@ -1424,7 +1587,7 @@ def run_cmd(
         changed = False
         for key in _read_keys_nonblocking():
             target_items = _sorted_target_items()
-            run_ids_sorted = sorted(state)
+            run_ids_sorted = sorted(rid for rid in state if state[rid]["result"] != "ignored")
 
             if key == "\t":
                 order = ["targets", "runs", "logs"]
@@ -1532,15 +1695,27 @@ def run_cmd(
         click.echo()
         click.echo("Ctrl-C to stop")
 
+    def _build_summary_lines() -> list[str]:
+        success_count = sum(1 for s in state.values() if s["result"] == "success")
+        failed = [s for s in state.values() if s["result"] in {"failed", "api_error", "not_retryable"}]
+        lines = [f"Final: {success_count}/{len(state)} succeeded, {len(failed)} need attention."]
+        for s in failed:
+            target = run_to_target.get(s["run"].id, "")
+            lines.append(f"  ✗ {_short_target(target)} → {s['run'].html_url} ({s['result']})")
+        return lines
+
     def _build_rich_dashboard() -> Any:
         if not _RICH_AVAILABLE or _RichTable is None or _RichPanel is None or _RichGroup is None:
             return "Rich TUI unavailable"
 
+        all_done = all(s["done"] for s in state.values())
         header = (
             f"Targets={len(target_state)} | Runs={len(state)} | "
             f"max-retries={max_retries} | interval={interval}s"
         )
-        if shutdown_requested:
+        if shutdown_requested and all_done:
+            header = f"{header} | status=done"
+        elif shutdown_requested:
             header = f"{header} | status=stopping"
         else:
             header = f"{header} | status=running"
@@ -1568,7 +1743,7 @@ def run_cmd(
             logs_rows = max(4, available_rows - targets_rows - runs_rows)
 
         target_items = _sorted_target_items()
-        run_ids_sorted = sorted(state)
+        run_ids_sorted = sorted(rid for rid in state if state[rid]["result"] != "ignored")
         log_items = list(events)
 
         ui_state["selected_targets"], ui_state["offset_targets"] = _ensure_selected_visible(
@@ -1617,9 +1792,9 @@ def run_cmd(
             absolute_index = ui_state["offset_targets"] + row_index
             selected = absolute_index == ui_state["selected_targets"] and ui_state["focus"] == "targets"
             prefix = ">" if selected else " "
-            title_block = f"{prefix} {_short_target(t)}\n  {_target_title_subtitle(t)}"
+            cell = _target_rich_cell(t, prefix)
             target_table.add_row(
-                title_block,
+                cell,
                 hint,
                 _target_label(t),
                 style="bold white on blue" if selected else "",
@@ -1645,12 +1820,29 @@ def run_cmd(
             label = f"{s['repo_name']}#{run_id}"
             live = f"{s['last_status']}/{s['last_conclusion'] or '-'}"
             run_target = run_to_target.get(run_id, "")
-            subtitle = _target_title_subtitle(run_target) if run_target else "PR title unavailable"
             absolute_index = ui_state["offset_runs"] + row_index
             selected = absolute_index == ui_state["selected_runs"] and ui_state["focus"] == "runs"
             prefix = ">" if selected else " "
+            if _RichText is not None:
+                cell: Any = _RichText()
+                cell.append(f"{prefix} {label}")
+                if run_target:
+                    t_state = target_state.get(run_target, {})
+                    base = str(t_state.get("pr_title", "")).strip()
+                    if t_state.get("is_backport"):
+                        branch = str(t_state.get("backport_target", "")).strip() or "unknown"
+                        source = int(t_state.get("backport_source_pr") or 0)
+                        source_part = f"#{source} " if source else ""
+                        cell.append(f"  \u21c6 backport {source_part}\u2192 {branch}", style="dim yellow")
+                        if base:
+                            cell.append(f"\n  {base}", style="dim")
+                    elif base:
+                        cell.append(f"\n  {base}", style="dim")
+            else:
+                subtitle = _target_title_subtitle(run_target) if run_target else ""
+                cell = f"{prefix} {label}" + (f"\n  {subtitle}" if subtitle else "")
             run_table.add_row(
-                f"{prefix} {label}\n  {subtitle}",
+                cell,
                 str(s["result"]),
                 f"{s['retries']}/{max_retries}",
                 live,
@@ -1674,14 +1866,21 @@ def run_cmd(
         else:
             logs_table.add_row("(no events yet)")
 
+        all_done = all(s["done"] for s in state.values())
+        if all_done or shutdown_requested:
+            summary_lines = _build_summary_lines()
+        else:
+            summary_lines = []
+
         help_text = (
             "TAB switch pane | j/k or arrows move/select | o/Enter open browser | "
             "g/G top/bottom | Ctrl-C exit"
         )
+        summary_text = ("\n" + "\n".join(summary_lines)) if summary_lines else ""
         header_panel = _RichPanel(
-            f"{header}\n{help_text}",
+            f"{header}\n{help_text}{summary_text}",
             title="gh-rerunner overwatch",
-            border_style="blue",
+            border_style="blue" if not (all_done or shutdown_requested) else "green" if all(s["result"] == "success" for s in state.values()) else "red",
         )
 
         # For wide screens, arrange target and run tables side-by-side
@@ -1815,34 +2014,33 @@ def run_cmd(
                     s["done"] = True
                     s["result"] = "not_retryable"
 
-            ui_changed = False
-            if use_rich_tui:
-                ui_changed = _handle_ui_keys()
-
             if use_rich_tui and live_obj is not None:
                 live_obj.update(_build_rich_dashboard())
             elif use_rolling:
                 _render_dashboard()
 
-            # Force refresh if window was resized
-            if window_resized:
-                window_resized = False
-                if use_rich_tui and live_obj is not None:
-                    live_obj.update(_build_rich_dashboard())
-                elif use_rolling:
-                    _render_dashboard()
-
-            if ui_changed and use_rich_tui and live_obj is not None:
-                live_obj.update(_build_rich_dashboard())
-
             if shutdown_requested:
-                if use_rich_tui and live_obj is not None:
-                    live_obj.update(_build_rich_dashboard())
-                elif use_rolling:
-                    _render_dashboard()
                 break
 
-            time.sleep(interval)
+            # Sleep in short ticks so key presses are handled responsively.
+            _KEY_TICK = 0.1
+            elapsed = 0.0
+            while elapsed < interval:
+                if shutdown_requested:
+                    break
+                time.sleep(_KEY_TICK)
+                elapsed += _KEY_TICK
+
+                if window_resized:
+                    window_resized = False
+                    if use_rich_tui and live_obj is not None:
+                        live_obj.update(_build_rich_dashboard())
+                    elif use_rolling:
+                        _render_dashboard()
+
+                if use_rich_tui and _handle_ui_keys():
+                    if live_obj is not None:
+                        live_obj.update(_build_rich_dashboard())
     except KeyboardInterrupt:
         shutdown_requested = True
         _event("Interrupted by user.")
@@ -1851,7 +2049,12 @@ def run_cmd(
         elif use_rolling:
             _render_dashboard()
     finally:
-        # Restore original signal handler
+        # Render final summary before stopping TUI
+        if use_rich_tui and live_obj is not None:
+            live_obj.update(_build_rich_dashboard())
+        elif use_rolling:
+            _render_dashboard()
+        # Restore original signal handlers and TTY
         if hasattr(signal, "SIGWINCH"):
             signal.signal(signal.SIGWINCH, original_sigwinch)
         if original_sigint is not None:
@@ -1863,11 +2066,13 @@ def run_cmd(
 
     success_count = sum(1 for s in state.values() if s["result"] == "success")
     failed_runs = [s for s in state.values() if s["result"] in {"failed", "api_error", "not_retryable"}]
-    click.echo()
-    click.echo(
-        f"Final summary: {success_count}/{len(state)} run(s) succeeded, "
-        f"{len(failed_runs)} need attention."
-    )
+
+    if not use_rich_tui:
+        click.echo()
+        click.echo(
+            f"Final summary: {success_count}/{len(state)} run(s) succeeded, "
+            f"{len(failed_runs)} need attention."
+        )
 
     if not sys.stdout.isatty():
         return
@@ -1894,17 +2099,6 @@ def run_cmd(
                     click.echo(f"  {label} manual rerun triggered.")
                 except GithubException as exc:
                     click.echo(f"  {label} manual rerun failed: {_exc_message(exc)}", err=True)
-    else:
-        choice = click.prompt(
-            "All attempts succeeded. Next action",
-            type=click.Choice(["quit", "show-targets"], case_sensitive=False),
-            default="show-targets",
-            show_choices=True,
-        )
-        if choice == "show-targets":
-            click.echo("Successful targets:")
-            for t in sorted(target_state):
-                click.echo(f"  - {_short_target(t)}")
 
 
 # ---------------------------------------------------------------------------

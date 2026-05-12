@@ -10,10 +10,15 @@ from gh_rerunner.cli import (
     _clean_pr_title,
     _count_approved_reviews,
     _collect_failed_jobs,
+    _extract_backport_source_pr,
+    _extract_backport_target_branch,
     _format_markdown_summary,
     _get_cached_pr_status,
     _pr_requirements_status,
     _render_context_lines,
+    _save_session,
+    _load_sessions,
+    _resolve_session_ref,
     _set_cached_pr_status,
 )
 
@@ -128,6 +133,7 @@ def test_pr_status_cache_round_trip():
         "branch": "feature/x",
         "detail": "CI failed",
         "title": "Fix flaky test",
+        "source_pr": 0,
     }
 
 
@@ -161,3 +167,40 @@ def test_build_pr_display_meta_marks_backport_and_branch():
     assert meta["pr_title"] == "add fix"
     assert meta["is_backport"] is True
     assert meta["backport_target"] == "release/3.1.x"
+
+
+def test_extract_backport_target_branch_bp_ref():
+    assert _extract_backport_target_branch("", "mergify/bp/release-3.11/pr-15111") == "release-3.11"
+    assert _extract_backport_target_branch("", "bp/main/pr-99") == "main"
+
+
+def test_extract_backport_source_pr():
+    assert _extract_backport_source_pr("Backport of #15111 to release/3.11") == 15111
+    assert _extract_backport_source_pr("cherry-pick #42 fixes") == 42
+    assert _extract_backport_source_pr("no pr here") == 0
+
+
+def test_session_save_and_load(tmp_path, monkeypatch):
+    import gh_rerunner.cli as cli_mod
+    session_file = tmp_path / "sessions.json"
+    monkeypatch.setattr(cli_mod, "_SESSION_PATH", session_file)
+
+    idx = _save_session("https://github.com/org/repo/pull/1\n", {})
+    assert idx == 1
+    sessions = _load_sessions()
+    assert len(sessions) == 1
+    assert "https://github.com/org/repo/pull/1" in sessions[0]["raw"]
+
+
+def test_session_resolve_ref(tmp_path, monkeypatch):
+    import gh_rerunner.cli as cli_mod
+    session_file = tmp_path / "sessions.json"
+    monkeypatch.setattr(cli_mod, "_SESSION_PATH", session_file)
+
+    _save_session("first\n", {})
+    _save_session("second\n", {})
+
+    assert _resolve_session_ref("#last") == "second\n"
+    assert _resolve_session_ref("#1") == "first\n"
+    assert _resolve_session_ref("#2") == "second\n"
+    assert _resolve_session_ref("#99") is None
