@@ -13,6 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 import zipfile
 from collections import deque
 from typing import Any, Optional
@@ -93,6 +94,14 @@ _MD_ENTRY_RE = re.compile(
     r"^\s*-\s+\[[^\]]+\]\((?P<url>https://github\.com/\S+)\)\s*(?P<detail>.*)$",
 )
 
+_CONVENTIONAL_TITLE_PREFIX_RE = re.compile(
+    r"^[a-zA-Z][a-zA-Z0-9_-]*(?:\([^)]+\))?(?:!)?:\s+"
+)
+
+_BACKPORT_TARGET_RE = re.compile(
+    r"(?i)\b(?:backport|cherry[- ]pick)(?:\s+to)?[\s:/_-]+(?P<branch>[A-Za-z0-9._/-]+)"
+)
+
 _CONFIG_PATH = Path.home() / ".gh-rerunner.json"
 _PR_STATUS_CACHE_PATH = Path.home() / ".gh-rerunner-cache.json"
 _PR_STATUS_CACHE_TTL_SECONDS = 300
@@ -127,6 +136,52 @@ def _infer_status_from_markdown_detail(detail: str) -> str:
     if "ci passed" in d:
         return "success"
     return ""
+
+
+def _clean_pr_title(title: str) -> str:
+    text = title.strip()
+    if not text:
+        return ""
+    return _CONVENTIONAL_TITLE_PREFIX_RE.sub("", text)
+
+
+def _extract_backport_target_branch(title: str, head_ref: str) -> str:
+    for source in (title, head_ref):
+        if not source:
+            continue
+        match = _BACKPORT_TARGET_RE.search(source)
+        if match:
+            branch = match.group("branch")
+            # Branch patterns like 123-to-release/3.1.x should resolve to release/3.1.x.
+            to_match = re.search(r"(?:^|[-_/])to[-_/](?P<branch>[A-Za-z0-9._/-]+)$", branch)
+            if to_match:
+                return to_match.group("branch")
+            return branch
+
+    ref = head_ref.lower()
+    if "backport" in ref:
+        match = re.search(r"(?:to|into|for)[-_](?P<branch>[A-Za-z0-9._/-]+)", head_ref)
+        if match:
+            return match.group("branch")
+    return ""
+
+
+def _build_pr_display_meta(title: str, head_ref: str) -> dict[str, Any]:
+    cleaned = _clean_pr_title(title) or title.strip()
+    backport_target = _extract_backport_target_branch(title, head_ref)
+    lowered = f"{title} {head_ref}".lower()
+    is_backport = bool(backport_target) or "backport" in lowered or "cherry-pick" in lowered
+
+    base_title = cleaned
+    if is_backport:
+        base_title = re.sub(r"(?i)\bbackport\b", "", cleaned).strip(" -:_") or cleaned
+
+    return {
+        "pr_title": cleaned,
+        "pr_base_title": base_title,
+        "is_backport": is_backport,
+        "backport_target": backport_target,
+    }
 
 
 def _parse_meta_comment_attrs(body: str) -> dict[str, str]:
@@ -1142,6 +1197,9 @@ def run_cmd(
                 "status_hint": entry.status or "unknown",
                 "run_ids": [],
                 "pr_title": "",
+                "pr_base_title": "",
+                "is_backport": False,
+                "backport_target": "",
             },
         )
 
@@ -1164,19 +1222,21 @@ def run_cmd(
         if pr_num is not None and repo_name:
             cached = _get_cached_pr_status(pr_status_cache, repo_name, pr_num)
             if cached is not None and cached.get("title"):
-                target_state[t]["pr_title"] = cached["title"]
+                meta = _build_pr_display_meta(cached.get("title", ""), cached.get("branch", ""))
+                target_state[t].update(meta)
             else:
                 try:
                     if pr_obj is None:
                         pr_obj = g.get_repo(repo_name).get_pull(pr_num)
                     title = str(getattr(pr_obj, "title", "")).strip()
-                    if title:
-                        target_state[t]["pr_title"] = title
+                    branch = str(getattr(getattr(pr_obj, "head", None), "ref", "") or "")
+                    meta = _build_pr_display_meta(title, branch)
+                    target_state[t].update(meta)
                     _set_cached_pr_status(
                         pr_status_cache,
                         repo_name,
                         pr_num,
-                        branch=str(getattr(getattr(pr_obj, "head", None), "ref", "") or ""),
+                        branch=branch,
                         detail=str(entry.status or "unknown"),
                         title=title,
                     )
@@ -1253,6 +1313,8 @@ def run_cmd(
         "offset_targets": 0,
         "offset_runs": 0,
         "offset_logs": 0,
+        "selected_targets": 0,
+        "selected_runs": 0,
     }
 
     def _event(msg: str) -> None:
@@ -1278,6 +1340,43 @@ def run_cmd(
         else:
             stage = f"FAILED({failed})"
         return f"{stage} | {ok}/{total} success"
+
+    def _target_title_subtitle(t_url: str) -> str:
+        t_state = target_state.get(t_url, {})
+        base = str(t_state.get("pr_title", "")).strip() or "PR title unavailable"
+        if t_state.get("is_backport"):
+            branch = str(t_state.get("backport_target", "")).strip() or "unknown"
+            return f"*BP* {base} -> {branch}"
+        return base
+
+    def _sorted_target_items() -> list[str]:
+        return sorted(
+            target_state,
+            key=lambda t_url: (
+                str(target_state[t_url].get("pr_base_title", "")).lower() or _short_target(t_url),
+                bool(target_state[t_url].get("is_backport", False)),
+                str(target_state[t_url].get("backport_target", "")).lower(),
+                _short_target(t_url),
+            ),
+        )
+
+    def _ensure_selected_visible(
+        total: int,
+        page_size: int,
+        selected: int,
+        offset: int,
+    ) -> tuple[int, int]:
+        if total <= 0:
+            return 0, 0
+
+        selected = max(0, min(selected, total - 1))
+        offset = _clip_offset(total, page_size, offset)
+        if selected < offset:
+            offset = selected
+        elif selected >= offset + max(1, page_size):
+            offset = selected - max(1, page_size) + 1
+        offset = _clip_offset(total, page_size, offset)
+        return selected, offset
 
     def _clip_offset(total: int, page_size: int, offset: int) -> int:
         if total <= 0:
@@ -1324,6 +1423,9 @@ def run_cmd(
     def _handle_ui_keys() -> bool:
         changed = False
         for key in _read_keys_nonblocking():
+            target_items = _sorted_target_items()
+            run_ids_sorted = sorted(state)
+
             if key == "\t":
                 order = ["targets", "runs", "logs"]
                 idx = order.index(ui_state["focus"])
@@ -1333,25 +1435,61 @@ def run_cmd(
 
             if key in {"j", "down"}:
                 focus = ui_state["focus"]
-                ui_state[f"offset_{focus}"] += 1
+                if focus in {"targets", "runs"}:
+                    selected_key = f"selected_{focus}"
+                    ui_state[selected_key] = min(
+                        ui_state[selected_key] + 1,
+                        max(0, (len(target_items) if focus == "targets" else len(run_ids_sorted)) - 1),
+                    )
+                else:
+                    ui_state[f"offset_{focus}"] += 1
                 changed = True
                 continue
 
             if key in {"k", "up"}:
                 focus = ui_state["focus"]
-                ui_state[f"offset_{focus}"] = max(0, ui_state[f"offset_{focus}"] - 1)
+                if focus in {"targets", "runs"}:
+                    selected_key = f"selected_{focus}"
+                    ui_state[selected_key] = max(0, ui_state[selected_key] - 1)
+                else:
+                    ui_state[f"offset_{focus}"] = max(0, ui_state[f"offset_{focus}"] - 1)
                 changed = True
                 continue
 
             if key == "g":
                 focus = ui_state["focus"]
-                ui_state[f"offset_{focus}"] = 0
+                if focus in {"targets", "runs"}:
+                    ui_state[f"selected_{focus}"] = 0
+                else:
+                    ui_state[f"offset_{focus}"] = 0
                 changed = True
                 continue
 
             if key == "G":
                 focus = ui_state["focus"]
-                ui_state[f"offset_{focus}"] = 10**9
+                if focus == "targets":
+                    ui_state["selected_targets"] = max(0, len(target_items) - 1)
+                elif focus == "runs":
+                    ui_state["selected_runs"] = max(0, len(run_ids_sorted) - 1)
+                else:
+                    ui_state[f"offset_{focus}"] = 10**9
+                changed = True
+                continue
+
+            if key in {"o", "\r", "\n"}:
+                focus = ui_state["focus"]
+                if focus == "targets" and target_items:
+                    index = max(0, min(ui_state["selected_targets"], len(target_items) - 1))
+                    target_url = target_items[index]
+                    webbrowser.open_new_tab(target_url)
+                    _event(f"Opened target in browser: {target_url}")
+                    changed = True
+                elif focus == "runs" and run_ids_sorted:
+                    index = max(0, min(ui_state["selected_runs"], len(run_ids_sorted) - 1))
+                    run_url = str(getattr(state[run_ids_sorted[index]]["run"], "html_url", ""))
+                    if run_url:
+                        webbrowser.open_new_tab(run_url)
+                        _event(f"Opened run in browser: {run_url}")
                 changed = True
                 continue
         return changed
@@ -1367,9 +1505,10 @@ def run_cmd(
             click.echo("Status: stopping (Ctrl-C received)")
         click.echo()
         click.echo("Target totals:")
-        for t in sorted(target_state):
+        for t in _sorted_target_items():
             hint = target_state[t]["status_hint"].upper()
             click.echo(f"  {_short_target(t)} [{hint}] -> {_target_label(t)}")
+            click.echo(f"    {_target_title_subtitle(t)}")
 
         click.echo()
         click.echo("Run states:")
@@ -1378,7 +1517,7 @@ def run_cmd(
             label = f"{s['repo_name']}#{run_id}"
             live = f"{s['last_status']}/{s['last_conclusion'] or '-'}"
             run_target = run_to_target.get(run_id, "")
-            pr_title = target_state.get(run_target, {}).get("pr_title") or "-"
+            pr_title = _target_title_subtitle(run_target) if run_target else "PR title unavailable"
             click.echo(
                 f"  {label} | PR: {pr_title} | {s['result']} | retries {s['retries']}/{max_retries} | {live}"
             )
@@ -1428,16 +1567,23 @@ def run_cmd(
             runs_rows = pane_rows
             logs_rows = max(4, available_rows - targets_rows - runs_rows)
 
-        target_items = sorted(target_state)
+        target_items = _sorted_target_items()
         run_ids_sorted = sorted(state)
         log_items = list(events)
 
-        ui_state["offset_targets"] = _clip_offset(
-            len(target_items), targets_rows, ui_state["offset_targets"]
+        ui_state["selected_targets"], ui_state["offset_targets"] = _ensure_selected_visible(
+            len(target_items),
+            targets_rows,
+            ui_state["selected_targets"],
+            ui_state["offset_targets"],
         )
-        ui_state["offset_runs"] = _clip_offset(
-            len(run_ids_sorted), runs_rows, ui_state["offset_runs"]
+        ui_state["selected_runs"], ui_state["offset_runs"] = _ensure_selected_visible(
+            len(run_ids_sorted),
+            runs_rows,
+            ui_state["selected_runs"],
+            ui_state["offset_runs"],
         )
+
         ui_state["offset_logs"] = _clip_offset(
             len(log_items), logs_rows, ui_state["offset_logs"]
         )
@@ -1463,14 +1609,21 @@ def run_cmd(
             expand=True,
             min_width=40,
         )
-        target_table.add_column("Target", style="cyan", overflow="fold")
-        target_table.add_column("PR", style="white", overflow="fold")
+        target_table.add_column("Target / PR", style="cyan", overflow="fold")
         target_table.add_column("Hint", style="magenta")
         target_table.add_column("State", style="green")
-        for t in visible_targets:
+        for row_index, t in enumerate(visible_targets):
             hint = target_state[t]["status_hint"].upper()
-            pr_title = target_state[t].get("pr_title") or "-"
-            target_table.add_row(_short_target(t), pr_title, hint, _target_label(t))
+            absolute_index = ui_state["offset_targets"] + row_index
+            selected = absolute_index == ui_state["selected_targets"] and ui_state["focus"] == "targets"
+            prefix = ">" if selected else " "
+            title_block = f"{prefix} {_short_target(t)}\n  {_target_title_subtitle(t)}"
+            target_table.add_row(
+                title_block,
+                hint,
+                _target_label(t),
+                style="bold white on blue" if selected else "",
+            )
 
         run_table = _RichTable(
             title=_pane_title(
@@ -1483,23 +1636,25 @@ def run_cmd(
             expand=True,
             min_width=40,
         )
-        run_table.add_column("Run", style="cyan", overflow="fold")
-        run_table.add_column("PR", style="white", overflow="fold")
+        run_table.add_column("Run / PR", style="cyan", overflow="fold")
         run_table.add_column("Result", style="green")
         run_table.add_column("Retries", style="yellow")
         run_table.add_column("Live", style="magenta")
-        for run_id in visible_runs:
+        for row_index, run_id in enumerate(visible_runs):
             s = state[run_id]
             label = f"{s['repo_name']}#{run_id}"
             live = f"{s['last_status']}/{s['last_conclusion'] or '-'}"
             run_target = run_to_target.get(run_id, "")
-            pr_title = target_state.get(run_target, {}).get("pr_title") or "-"
+            subtitle = _target_title_subtitle(run_target) if run_target else "PR title unavailable"
+            absolute_index = ui_state["offset_runs"] + row_index
+            selected = absolute_index == ui_state["selected_runs"] and ui_state["focus"] == "runs"
+            prefix = ">" if selected else " "
             run_table.add_row(
-                label,
-                pr_title,
+                f"{prefix} {label}\n  {subtitle}",
                 str(s["result"]),
                 f"{s['retries']}/{max_retries}",
                 live,
+                style="bold white on blue" if selected else "",
             )
 
         logs_table = _RichTable(
@@ -1519,7 +1674,10 @@ def run_cmd(
         else:
             logs_table.add_row("(no events yet)")
 
-        help_text = "TAB switch pane | j/k or arrows scroll | g/G top/bottom | Ctrl-C exit"
+        help_text = (
+            "TAB switch pane | j/k or arrows move/select | o/Enter open browser | "
+            "g/G top/bottom | Ctrl-C exit"
+        )
         header_panel = _RichPanel(
             f"{header}\n{help_text}",
             title="gh-rerunner overwatch",

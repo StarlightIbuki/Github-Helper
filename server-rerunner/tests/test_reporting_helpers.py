@@ -6,6 +6,8 @@ from types import SimpleNamespace
 import click
 
 from gh_rerunner.cli import (
+    _build_pr_display_meta,
+    _clean_pr_title,
     _count_approved_reviews,
     _collect_failed_jobs,
     _format_markdown_summary,
@@ -143,3 +145,19 @@ def test_pr_status_cache_expires_by_ttl():
 
     # TTL is 0 sec here, so entry is always stale.
     assert _get_cached_pr_status(cache, "org/repo", 1, ttl_seconds=0) is None
+
+
+def test_clean_pr_title_strips_conventional_prefix():
+    assert _clean_pr_title("feat(ci): improve retries") == "improve retries"
+    assert _clean_pr_title("fix!: breaking tweak") == "breaking tweak"
+
+
+def test_build_pr_display_meta_marks_backport_and_branch():
+    meta = _build_pr_display_meta(
+        "chore(backport): add fix",
+        "backport/123-to-release/3.1.x",
+    )
+
+    assert meta["pr_title"] == "add fix"
+    assert meta["is_backport"] is True
+    assert meta["backport_target"] == "release/3.1.x"
