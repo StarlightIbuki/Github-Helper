@@ -4,6 +4,9 @@ from __future__ import annotations
 import io
 import importlib
 import json
+import os
+import select
+import signal
 from pathlib import Path
 import re
 import sys
@@ -13,6 +16,13 @@ import urllib.request
 import zipfile
 from collections import deque
 from typing import Any, Optional
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 import click
 from github import Github, GithubException
@@ -46,7 +56,7 @@ _URL_RE = re.compile(
 _DONE_CONCLUSIONS = {"success", "neutral", "skipped"}
 
 # Conclusions that warrant a rerun
-_RETRY_CONCLUSIONS = {"failure", "timed_out", "action_required"}
+_RETRY_CONCLUSIONS = {"failure", "timed_out", "action_required", "cancelled"}
 
 # Summary status hints that mean there is nothing left to do
 _SKIP_STATUSES = {"merged", "success", "closed"}
@@ -84,6 +94,8 @@ _MD_ENTRY_RE = re.compile(
 )
 
 _CONFIG_PATH = Path.home() / ".gh-rerunner.json"
+_PR_STATUS_CACHE_PATH = Path.home() / ".gh-rerunner-cache.json"
+_PR_STATUS_CACHE_TTL_SECONDS = 300
 _DEFAULT_REPO_CONFIG = {
     "ignore_ci": [],
     "required_labels": [],
@@ -165,6 +177,76 @@ def _save_user_config(data: dict[str, Any]) -> None:
     _CONFIG_PATH.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _load_pr_status_cache() -> dict[str, Any]:
+    if not _PR_STATUS_CACHE_PATH.exists():
+        return {"prs": {}}
+    try:
+        data = json.loads(_PR_STATUS_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"prs": {}}
+    if not isinstance(data, dict):
+        return {"prs": {}}
+    prs = data.get("prs")
+    if not isinstance(prs, dict):
+        data["prs"] = {}
+    return data
+
+
+def _save_pr_status_cache(data: dict[str, Any]) -> None:
+    if "prs" not in data or not isinstance(data["prs"], dict):
+        data["prs"] = {}
+    _PR_STATUS_CACHE_PATH.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _pr_cache_key(repo_name: str, pr_number: int) -> str:
+    return f"{repo_name}#{pr_number}"
+
+
+def _get_cached_pr_status(
+    cache_data: dict[str, Any],
+    repo_name: str,
+    pr_number: int,
+    ttl_seconds: int = _PR_STATUS_CACHE_TTL_SECONDS,
+) -> Optional[dict[str, str]]:
+    prs = cache_data.get("prs", {}) if isinstance(cache_data, dict) else {}
+    if not isinstance(prs, dict):
+        return None
+    raw = prs.get(_pr_cache_key(repo_name, pr_number))
+    if not isinstance(raw, dict):
+        return None
+    ts = raw.get("ts")
+    if not isinstance(ts, (int, float)):
+        return None
+    if time.time() - float(ts) > ttl_seconds:
+        return None
+    branch = raw.get("branch")
+    detail = raw.get("detail")
+    title = raw.get("title", "")
+    if not isinstance(branch, str) or not isinstance(detail, str) or not isinstance(title, str):
+        return None
+    return {"branch": branch, "detail": detail, "title": title}
+
+
+def _set_cached_pr_status(
+    cache_data: dict[str, Any],
+    repo_name: str,
+    pr_number: int,
+    branch: str,
+    detail: str,
+    title: str,
+) -> None:
+    prs = cache_data.setdefault("prs", {})
+    if not isinstance(prs, dict):
+        cache_data["prs"] = {}
+        prs = cache_data["prs"]
+    prs[_pr_cache_key(repo_name, pr_number)] = {
+        "ts": time.time(),
+        "branch": branch,
+        "detail": detail,
+        "title": title,
+    }
+
+
 def _repo_config(data: dict[str, Any], repo: str) -> dict[str, Any]:
     repos = data.get("repos") if isinstance(data, dict) else None
     cfg = repos.get(repo, {}) if isinstance(repos, dict) else {}
@@ -193,6 +275,13 @@ def _target_repo(target: str, repo_opt: Optional[str]) -> Optional[str]:
     if target.isdigit():
         return repo_opt
     return None
+
+
+def _target_pr_number(target: str) -> Optional[int]:
+    m = _URL_RE.search(target)
+    if not m or m.group("kind") != "pull":
+        return None
+    return int(m.group("num"))
 
 
 def _count_approved_reviews(pr: Any) -> int:
@@ -346,6 +435,8 @@ def _collect_assigned_pr_entries(
     metadata["scope"] = "open+closed" if include_closed else "open"
 
     filter_re = _compile_regex(filter_pattern)
+    pr_status_cache = _load_pr_status_cache()
+    cache_changed = False
 
     queries = [f"is:pr assignee:{login} is:open"]
     if include_closed:
@@ -371,19 +462,38 @@ def _collect_assigned_pr_entries(
 
             detail = "CI unavailable"
             branch = getattr(issue, "title", "PR")
-            try:
-                repo = g.get_repo(issue.repository.full_name)
-                pr = repo.get_pull(issue.number)
-                branch = pr.head.ref or branch
-                detail = _pick_pr_status(repo, pr)
-            except GithubException:
-                pass
+            title = str(getattr(issue, "title", "") or "").strip()
+            repo_full_name = str(getattr(issue.repository, "full_name", ""))
+
+            cached = _get_cached_pr_status(pr_status_cache, repo_full_name, issue.number)
+            if cached is not None:
+                branch = cached["branch"] or branch
+                detail = cached["detail"] or detail
+                title = cached["title"] or title
+            else:
+                try:
+                    repo = g.get_repo(repo_full_name)
+                    pr = repo.get_pull(issue.number)
+                    branch = pr.head.ref or branch
+                    detail = _pick_pr_status(repo, pr)
+                    title = str(getattr(pr, "title", "") or title).strip()
+                    _set_cached_pr_status(
+                        pr_status_cache,
+                        repo_full_name,
+                        issue.number,
+                        branch,
+                        detail,
+                        title,
+                    )
+                    cache_changed = True
+                except GithubException:
+                    pass
 
             if filter_re and not (
                 filter_re.search(branch)
                 or filter_re.search(url)
-                or filter_re.search(getattr(issue, "title", ""))
-                or filter_re.search(getattr(issue.repository, "full_name", ""))
+                or filter_re.search(title)
+                or filter_re.search(repo_full_name)
             ):
                 continue
 
@@ -395,6 +505,8 @@ def _collect_assigned_pr_entries(
             click.echo(f"    {count} {state} assigned PR(s) processed", err=True)
 
     title = f"Assigned PRs for @{login}"
+    if cache_changed:
+        _save_pr_status_cache(pr_status_cache)
     return title, entries, metadata
 
 
@@ -929,6 +1041,8 @@ def run_cmd(
     """
     g = Github(token)
     user_cfg = _load_user_config()
+    pr_status_cache = _load_pr_status_cache()
+    pr_cache_changed = False
 
     # --- Collect raw summary text from all input sources ---
     raw_text_parts: list[str] = []
@@ -1027,22 +1141,48 @@ def run_cmd(
                 "source": t,
                 "status_hint": entry.status or "unknown",
                 "run_ids": [],
+                "pr_title": "",
             },
         )
 
         url_match = _URL_RE.search(t)
+        pr_num = _target_pr_number(t)
+        pr_obj: Any = None
         if url_match and url_match.group("kind") == "pull" and repo_name:
             required_labels = repo_rules.get("required_labels", [])
             required_reviews = int(repo_rules.get("required_reviews", 0) or 0)
             if required_labels or required_reviews > 0:
                 try:
-                    pr = g.get_repo(repo_name).get_pull(int(url_match.group("num")))
+                    pr_obj = g.get_repo(repo_name).get_pull(int(url_match.group("num")))
                 except GithubException as exc:
                     raise click.ClickException(f"Cannot load PR for requirements check {t!r}: {_exc_message(exc)}")
-                ok, reason = _pr_requirements_status(pr, repo_rules)
+                ok, reason = _pr_requirements_status(pr_obj, repo_rules)
                 if not ok:
                     click.echo(f"  skipping [REQUIREMENTS] {t} — {reason}")
                     continue
+
+        if pr_num is not None and repo_name:
+            cached = _get_cached_pr_status(pr_status_cache, repo_name, pr_num)
+            if cached is not None and cached.get("title"):
+                target_state[t]["pr_title"] = cached["title"]
+            else:
+                try:
+                    if pr_obj is None:
+                        pr_obj = g.get_repo(repo_name).get_pull(pr_num)
+                    title = str(getattr(pr_obj, "title", "")).strip()
+                    if title:
+                        target_state[t]["pr_title"] = title
+                    _set_cached_pr_status(
+                        pr_status_cache,
+                        repo_name,
+                        pr_num,
+                        branch=str(getattr(getattr(pr_obj, "head", None), "ref", "") or ""),
+                        detail=str(entry.status or "unknown"),
+                        title=title,
+                    )
+                    pr_cache_changed = True
+                except GithubException:
+                    pass
 
         try:
             resolved = _resolve_target(t, repo_opt, g)
@@ -1064,6 +1204,9 @@ def run_cmd(
 
     if not all_runs:
         raise click.ClickException("No workflow runs found for the given targets.")
+
+    if pr_cache_changed:
+        _save_pr_status_cache(pr_status_cache)
 
     # Keep a fixed terminal window when interactive; in non-tty contexts,
     # retain the previous streaming behavior.
@@ -1105,6 +1248,12 @@ def run_cmd(
             run_to_target[run_id] = t
 
     events: deque[str] = deque(maxlen=window_lines)
+    ui_state: dict[str, Any] = {
+        "focus": "runs",
+        "offset_targets": 0,
+        "offset_runs": 0,
+        "offset_logs": 0,
+    }
 
     def _event(msg: str) -> None:
         ts = time.strftime("%H:%M:%S")
@@ -1130,6 +1279,83 @@ def run_cmd(
             stage = f"FAILED({failed})"
         return f"{stage} | {ok}/{total} success"
 
+    def _clip_offset(total: int, page_size: int, offset: int) -> int:
+        if total <= 0:
+            return 0
+        max_offset = max(0, total - max(1, page_size))
+        return max(0, min(offset, max_offset))
+
+    def _scroll_meta(total: int, page_size: int, offset: int) -> str:
+        if total == 0:
+            return "0/0"
+        start = offset + 1
+        end = min(total, offset + page_size)
+        return f"{start}-{end}/{total}"
+
+    def _pane_title(base: str, pane: str, total: int, page_size: int, offset: int) -> str:
+        marker = "*" if ui_state["focus"] == pane else " "
+        return f"{marker} {base} [{_scroll_meta(total, page_size, offset)}]"
+
+    def _read_keys_nonblocking() -> list[str]:
+        if not sys.stdin.isatty() or termios is None:
+            return []
+
+        keys: list[str] = []
+        try:
+            while True:
+                ready, _, _ = select.select([sys.stdin], [], [], 0)
+                if not ready:
+                    break
+                data = os.read(sys.stdin.fileno(), 32)
+                if not data:
+                    break
+                text = data.decode("utf-8", errors="ignore")
+                while "\x1b[A" in text:
+                    keys.append("up")
+                    text = text.replace("\x1b[A", "", 1)
+                while "\x1b[B" in text:
+                    keys.append("down")
+                    text = text.replace("\x1b[B", "", 1)
+                keys.extend(list(text))
+        except (OSError, ValueError):
+            return []
+        return keys
+
+    def _handle_ui_keys() -> bool:
+        changed = False
+        for key in _read_keys_nonblocking():
+            if key == "\t":
+                order = ["targets", "runs", "logs"]
+                idx = order.index(ui_state["focus"])
+                ui_state["focus"] = order[(idx + 1) % len(order)]
+                changed = True
+                continue
+
+            if key in {"j", "down"}:
+                focus = ui_state["focus"]
+                ui_state[f"offset_{focus}"] += 1
+                changed = True
+                continue
+
+            if key in {"k", "up"}:
+                focus = ui_state["focus"]
+                ui_state[f"offset_{focus}"] = max(0, ui_state[f"offset_{focus}"] - 1)
+                changed = True
+                continue
+
+            if key == "g":
+                focus = ui_state["focus"]
+                ui_state[f"offset_{focus}"] = 0
+                changed = True
+                continue
+
+            if key == "G":
+                focus = ui_state["focus"]
+                ui_state[f"offset_{focus}"] = 10**9
+                changed = True
+                continue
+        return changed
+
     def _render_dashboard() -> None:
         click.clear()
         click.echo("gh-rerunner live dashboard")
@@ -1137,6 +1363,8 @@ def run_cmd(
             f"Targets={len(target_state)} | Runs={len(state)} | "
             f"max-retries={max_retries} | interval={interval}s"
         )
+        if shutdown_requested:
+            click.echo("Status: stopping (Ctrl-C received)")
         click.echo()
         click.echo("Target totals:")
         for t in sorted(target_state):
@@ -1149,8 +1377,10 @@ def run_cmd(
             s = state[run_id]
             label = f"{s['repo_name']}#{run_id}"
             live = f"{s['last_status']}/{s['last_conclusion'] or '-'}"
+            run_target = run_to_target.get(run_id, "")
+            pr_title = target_state.get(run_target, {}).get("pr_title") or "-"
             click.echo(
-                f"  {label} | {s['result']} | retries {s['retries']}/{max_retries} | {live}"
+                f"  {label} | PR: {pr_title} | {s['result']} | retries {s['retries']}/{max_retries} | {live}"
             )
 
         click.echo()
@@ -1171,41 +1401,149 @@ def run_cmd(
             f"Targets={len(target_state)} | Runs={len(state)} | "
             f"max-retries={max_retries} | interval={interval}s"
         )
+        if shutdown_requested:
+            header = f"{header} | status=stopping"
+        else:
+            header = f"{header} | status=running"
 
-        target_table = _RichTable(title="Target Totals", expand=True)
+        # Get terminal size to decide layout and page sizes.
+        try:
+            term_size = os.get_terminal_size()
+            term_width = term_size.columns
+            term_height = term_size.lines
+        except OSError:
+            term_width = 80
+            term_height = 24
+
+        is_wide = term_width >= 140
+        available_rows = max(12, term_height - 10)
+        if is_wide:
+            top_rows = max(4, min(available_rows - 4, available_rows // 2))
+            targets_rows = top_rows
+            runs_rows = top_rows
+            logs_rows = max(4, available_rows - top_rows)
+        else:
+            pane_rows = max(4, available_rows // 3)
+            targets_rows = pane_rows
+            runs_rows = pane_rows
+            logs_rows = max(4, available_rows - targets_rows - runs_rows)
+
+        target_items = sorted(target_state)
+        run_ids_sorted = sorted(state)
+        log_items = list(events)
+
+        ui_state["offset_targets"] = _clip_offset(
+            len(target_items), targets_rows, ui_state["offset_targets"]
+        )
+        ui_state["offset_runs"] = _clip_offset(
+            len(run_ids_sorted), runs_rows, ui_state["offset_runs"]
+        )
+        ui_state["offset_logs"] = _clip_offset(
+            len(log_items), logs_rows, ui_state["offset_logs"]
+        )
+
+        visible_targets = target_items[
+            ui_state["offset_targets"]: ui_state["offset_targets"] + targets_rows
+        ]
+        visible_runs = run_ids_sorted[
+            ui_state["offset_runs"]: ui_state["offset_runs"] + runs_rows
+        ]
+        visible_logs = log_items[
+            ui_state["offset_logs"]: ui_state["offset_logs"] + logs_rows
+        ]
+
+        target_table = _RichTable(
+            title=_pane_title(
+                "Target Totals",
+                "targets",
+                len(target_items),
+                targets_rows,
+                ui_state["offset_targets"],
+            ),
+            expand=True,
+            min_width=40,
+        )
         target_table.add_column("Target", style="cyan", overflow="fold")
+        target_table.add_column("PR", style="white", overflow="fold")
         target_table.add_column("Hint", style="magenta")
         target_table.add_column("State", style="green")
-        for t in sorted(target_state):
+        for t in visible_targets:
             hint = target_state[t]["status_hint"].upper()
-            target_table.add_row(_short_target(t), hint, _target_label(t))
+            pr_title = target_state[t].get("pr_title") or "-"
+            target_table.add_row(_short_target(t), pr_title, hint, _target_label(t))
 
-        run_table = _RichTable(title="Run States", expand=True)
+        run_table = _RichTable(
+            title=_pane_title(
+                "Run States",
+                "runs",
+                len(run_ids_sorted),
+                runs_rows,
+                ui_state["offset_runs"],
+            ),
+            expand=True,
+            min_width=40,
+        )
         run_table.add_column("Run", style="cyan", overflow="fold")
+        run_table.add_column("PR", style="white", overflow="fold")
         run_table.add_column("Result", style="green")
         run_table.add_column("Retries", style="yellow")
         run_table.add_column("Live", style="magenta")
-        for run_id in sorted(state):
+        for run_id in visible_runs:
             s = state[run_id]
             label = f"{s['repo_name']}#{run_id}"
             live = f"{s['last_status']}/{s['last_conclusion'] or '-'}"
+            run_target = run_to_target.get(run_id, "")
+            pr_title = target_state.get(run_target, {}).get("pr_title") or "-"
             run_table.add_row(
                 label,
+                pr_title,
                 str(s["result"]),
                 f"{s['retries']}/{max_retries}",
                 live,
             )
 
-        logs_table = _RichTable(title=f"Recent Logs (last {window_lines})", expand=True)
+        logs_table = _RichTable(
+            title=_pane_title(
+                "Recent Logs",
+                "logs",
+                len(log_items),
+                logs_rows,
+                ui_state["offset_logs"],
+            ),
+            expand=True,
+        )
         logs_table.add_column("Event", overflow="fold")
-        if events:
-            for event in events:
+        if visible_logs:
+            for event in visible_logs:
                 logs_table.add_row(event)
         else:
             logs_table.add_row("(no events yet)")
 
+        help_text = "TAB switch pane | j/k or arrows scroll | g/G top/bottom | Ctrl-C exit"
+        header_panel = _RichPanel(
+            f"{header}\n{help_text}",
+            title="gh-rerunner overwatch",
+            border_style="blue",
+        )
+
+        # For wide screens, arrange target and run tables side-by-side
+        if is_wide:
+            # Import Columns for side-by-side layout (available in rich 12.0+)
+            try:
+                _rich_columns = importlib.import_module("rich.columns")
+                _Columns = getattr(_rich_columns, "Columns", None)
+                if _Columns:
+                    return _RichGroup(
+                        header_panel,
+                        _Columns([target_table, run_table]),
+                        logs_table,
+                    )
+            except (ImportError, AttributeError):
+                pass
+
+        # Default vertical layout for narrower terminals
         return _RichGroup(
-            _RichPanel(header, title="gh-rerunner overwatch", border_style="blue"),
+            header_panel,
             target_table,
             run_table,
             logs_table,
@@ -1220,14 +1558,44 @@ def run_cmd(
     # Polling loop
     # -----------------------------------------------------------------------
     live_obj: Any = None
+    window_resized = False
+    original_sigwinch: Any = None
+    original_sigint: Any = None
+    original_tty: Any = None
+    shutdown_requested = False
+
+    def _on_window_resize(signum: int, frame: Any) -> None:
+        """Signal handler for terminal window resize."""
+        nonlocal window_resized
+        window_resized = True
+
+    def _on_sigint(signum: int, frame: Any) -> None:
+        """SIGINT handler to integrate Ctrl-C with dashboard rendering."""
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            raise KeyboardInterrupt
+        shutdown_requested = True
+        _event("Interrupted by user (Ctrl-C) — shutting down...")
+
+    # Set up signal handler for window resize (Unix/Linux/macOS)
+    if hasattr(signal, "SIGWINCH"):
+        original_sigwinch = signal.signal(signal.SIGWINCH, _on_window_resize)
+    original_sigint = signal.signal(signal.SIGINT, _on_sigint)
+
     try:
         if use_rich_tui:
             if _RichLive is None:
                 raise click.ClickException("Rich TUI requested but rich is not available.")
+            if termios is not None and tty is not None and sys.stdin.isatty():
+                original_tty = termios.tcgetattr(sys.stdin.fileno())
+                tty.setcbreak(sys.stdin.fileno())
             live_obj = _RichLive(_build_rich_dashboard(), refresh_per_second=4)
             live_obj.start()
 
         while True:
+            if shutdown_requested:
+                break
+
             pending = [s for s in state.values() if not s["done"]]
             if not pending:
                 _event("All runs finished.")
@@ -1289,18 +1657,49 @@ def run_cmd(
                     s["done"] = True
                     s["result"] = "not_retryable"
 
+            ui_changed = False
+            if use_rich_tui:
+                ui_changed = _handle_ui_keys()
+
             if use_rich_tui and live_obj is not None:
                 live_obj.update(_build_rich_dashboard())
             elif use_rolling:
                 _render_dashboard()
+
+            # Force refresh if window was resized
+            if window_resized:
+                window_resized = False
+                if use_rich_tui and live_obj is not None:
+                    live_obj.update(_build_rich_dashboard())
+                elif use_rolling:
+                    _render_dashboard()
+
+            if ui_changed and use_rich_tui and live_obj is not None:
+                live_obj.update(_build_rich_dashboard())
+
+            if shutdown_requested:
+                if use_rich_tui and live_obj is not None:
+                    live_obj.update(_build_rich_dashboard())
+                elif use_rolling:
+                    _render_dashboard()
+                break
+
             time.sleep(interval)
     except KeyboardInterrupt:
+        shutdown_requested = True
         _event("Interrupted by user.")
         if use_rich_tui and live_obj is not None:
             live_obj.update(_build_rich_dashboard())
         elif use_rolling:
             _render_dashboard()
     finally:
+        # Restore original signal handler
+        if hasattr(signal, "SIGWINCH"):
+            signal.signal(signal.SIGWINCH, original_sigwinch)
+        if original_sigint is not None:
+            signal.signal(signal.SIGINT, original_sigint)
+        if original_tty is not None and termios is not None and sys.stdin.isatty():
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, original_tty)
         if live_obj is not None:
             live_obj.stop()
 
