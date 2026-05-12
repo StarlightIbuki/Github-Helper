@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import io
 import importlib
+import json
+from pathlib import Path
 import re
 import sys
 import time
@@ -81,6 +83,13 @@ _MD_ENTRY_RE = re.compile(
     r"^\s*-\s+\[[^\]]+\]\((?P<url>https://github\.com/\S+)\)\s*(?P<detail>.*)$",
 )
 
+_CONFIG_PATH = Path.home() / ".gh-rerunner.json"
+_DEFAULT_REPO_CONFIG = {
+    "ignore_ci": [],
+    "required_labels": [],
+    "required_reviews": 0,
+}
+
 
 def _short_target(url: str) -> str:
     """Compact target label for terminal output."""
@@ -133,6 +142,90 @@ def _append_entry(entries: list[SummaryEntry], seen: set[str], status: str, url:
     if url not in seen:
         seen.add(url)
         entries.append(SummaryEntry(status, url))
+
+
+def _load_user_config() -> dict[str, Any]:
+    if not _CONFIG_PATH.exists():
+        return {"repos": {}}
+    try:
+        data = json.loads(_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {"repos": {}}
+    if not isinstance(data, dict):
+        return {"repos": {}}
+    repos = data.get("repos")
+    if not isinstance(repos, dict):
+        data["repos"] = {}
+    return data
+
+
+def _save_user_config(data: dict[str, Any]) -> None:
+    if "repos" not in data or not isinstance(data["repos"], dict):
+        data["repos"] = {}
+    _CONFIG_PATH.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _repo_config(data: dict[str, Any], repo: str) -> dict[str, Any]:
+    repos = data.get("repos") if isinstance(data, dict) else None
+    cfg = repos.get(repo, {}) if isinstance(repos, dict) else {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    ignore_ci = cfg.get("ignore_ci", [])
+    required_labels = cfg.get("required_labels", [])
+    required_reviews = cfg.get("required_reviews", 0)
+    if not isinstance(ignore_ci, list):
+        ignore_ci = []
+    if not isinstance(required_labels, list):
+        required_labels = []
+    if not isinstance(required_reviews, int):
+        required_reviews = 0
+    return {
+        "ignore_ci": [str(x).strip() for x in ignore_ci if str(x).strip()],
+        "required_labels": [str(x).strip() for x in required_labels if str(x).strip()],
+        "required_reviews": max(required_reviews, 0),
+    }
+
+
+def _target_repo(target: str, repo_opt: Optional[str]) -> Optional[str]:
+    m = _URL_RE.search(target)
+    if m:
+        return m.group("repo")
+    if target.isdigit():
+        return repo_opt
+    return None
+
+
+def _count_approved_reviews(pr: Any) -> int:
+    latest_state_by_user: dict[str, str] = {}
+    for review in pr.get_reviews():
+        user = getattr(getattr(review, "user", None), "login", None)
+        if not user:
+            continue
+        latest_state_by_user[user] = str(getattr(review, "state", "")).upper()
+    return sum(1 for state in latest_state_by_user.values() if state == "APPROVED")
+
+
+def _pr_requirements_status(pr: Any, cfg: dict[str, Any]) -> tuple[bool, str]:
+    required_labels = cfg.get("required_labels", [])
+    required_reviews = int(cfg.get("required_reviews", 0) or 0)
+
+    missing_labels: list[str] = []
+    if required_labels:
+        present = [str(getattr(label, "name", "")).lower() for label in getattr(pr, "labels", [])]
+        for req in required_labels:
+            req_l = str(req).lower()
+            if not any(req_l in p for p in present):
+                missing_labels.append(str(req))
+
+    approved_count = 0
+    if required_reviews > 0:
+        approved_count = _count_approved_reviews(pr)
+
+    if missing_labels:
+        return False, f"missing labels: {', '.join(missing_labels)}"
+    if required_reviews > 0 and approved_count < required_reviews:
+        return False, f"approved reviews {approved_count}/{required_reviews}"
+    return True, "ok"
 
 
 def _parse_structured_line(line: str) -> Optional[tuple[str, str]]:
@@ -391,7 +484,7 @@ def _render_context_lines(
     return rendered
 
 
-def _collect_failed_jobs(run: WorkflowRun) -> list[Any]:
+def _collect_failed_jobs(run: Any) -> list[Any]:
     return [
         job for job in run.jobs()
         if (job.conclusion or "").lower() in _RETRY_CONCLUSIONS
@@ -606,6 +699,73 @@ def auth_cmd() -> None:
 
 
 # ---------------------------------------------------------------------------
+# config subcommands
+# ---------------------------------------------------------------------------
+
+@main.group("config")
+def config_group() -> None:
+    """Manage persistent per-repo defaults stored in ~/.gh-rerunner.json."""
+
+
+@config_group.command("show")
+@click.option("--repo", "repo_opt", default=None, metavar="OWNER/REPO", help="Show config for one repo only.")
+def config_show_cmd(repo_opt: Optional[str]) -> None:
+    cfg = _load_user_config()
+    repos = cfg.get("repos", {}) if isinstance(cfg, dict) else {}
+    if repo_opt:
+        one = _repo_config(cfg, repo_opt)
+        click.echo(json.dumps({"path": str(_CONFIG_PATH), "repo": repo_opt, "config": one}, indent=2))
+        return
+    click.echo(json.dumps({"path": str(_CONFIG_PATH), "repos": repos}, indent=2, sort_keys=True))
+
+
+@config_group.command("set")
+@click.option("--repo", "repo_opt", required=True, metavar="OWNER/REPO", help="Repository key to configure.")
+@click.option("--ignore-ci", default=None, metavar="JOB[,JOB...]", help="Comma-separated ignored CI job substrings.")
+@click.option("--required-labels", default=None, metavar="LABEL[,LABEL...]", help="Comma-separated required label substrings.")
+@click.option("--required-reviews", default=None, type=click.IntRange(0, 100), help="Required number of approvals.")
+def config_set_cmd(
+    repo_opt: str,
+    ignore_ci: Optional[str],
+    required_labels: Optional[str],
+    required_reviews: Optional[int],
+) -> None:
+    if ignore_ci is None and required_labels is None and required_reviews is None:
+        raise click.UsageError("Provide at least one setting to update.")
+
+    cfg = _load_user_config()
+    repos = cfg.setdefault("repos", {})
+    if not isinstance(repos, dict):
+        cfg["repos"] = {}
+        repos = cfg["repos"]
+
+    current = _repo_config(cfg, repo_opt)
+    if ignore_ci is not None:
+        current["ignore_ci"] = [x.strip() for x in ignore_ci.split(",") if x.strip()]
+    if required_labels is not None:
+        current["required_labels"] = [x.strip() for x in required_labels.split(",") if x.strip()]
+    if required_reviews is not None:
+        current["required_reviews"] = required_reviews
+
+    repos[repo_opt] = current
+    _save_user_config(cfg)
+    click.echo(f"Saved config for {repo_opt} at {_CONFIG_PATH}")
+
+
+@config_group.command("clear")
+@click.option("--repo", "repo_opt", required=True, metavar="OWNER/REPO", help="Repository key to remove.")
+def config_clear_cmd(repo_opt: str) -> None:
+    cfg = _load_user_config()
+    repos = cfg.get("repos", {}) if isinstance(cfg, dict) else {}
+    if isinstance(repos, dict) and repo_opt in repos:
+        repos.pop(repo_opt, None)
+        _save_user_config(cfg)
+        click.echo(f"Removed config for {repo_opt} from {_CONFIG_PATH}")
+    else:
+        click.echo(f"No saved config for {repo_opt}")
+
+
+# ---------------------------------------------------------------------------
 # assigned-prs subcommand
 # ---------------------------------------------------------------------------
 
@@ -768,6 +928,7 @@ def run_cmd(
       cat summary.txt | gh-rerunner run -n 5 -i 60
     """
     g = Github(token)
+    user_cfg = _load_user_config()
 
     # --- Collect raw summary text from all input sources ---
     raw_text_parts: list[str] = []
@@ -854,9 +1015,12 @@ def run_cmd(
     # -----------------------------------------------------------------------
     all_runs: list[WorkflowRun] = []
     target_state: dict[str, dict] = {}
+    run_ignore_ci: dict[int, list[str]] = {}
 
     for entry in active_entries:
         t = entry.url
+        repo_name = _target_repo(t, repo_opt)
+        repo_rules = _repo_config(user_cfg, repo_name) if repo_name else _DEFAULT_REPO_CONFIG
         target_state.setdefault(
             t,
             {
@@ -865,6 +1029,21 @@ def run_cmd(
                 "run_ids": [],
             },
         )
+
+        url_match = _URL_RE.search(t)
+        if url_match and url_match.group("kind") == "pull" and repo_name:
+            required_labels = repo_rules.get("required_labels", [])
+            required_reviews = int(repo_rules.get("required_reviews", 0) or 0)
+            if required_labels or required_reviews > 0:
+                try:
+                    pr = g.get_repo(repo_name).get_pull(int(url_match.group("num")))
+                except GithubException as exc:
+                    raise click.ClickException(f"Cannot load PR for requirements check {t!r}: {_exc_message(exc)}")
+                ok, reason = _pr_requirements_status(pr, repo_rules)
+                if not ok:
+                    click.echo(f"  skipping [REQUIREMENTS] {t} — {reason}")
+                    continue
+
         try:
             resolved = _resolve_target(t, repo_opt, g)
         except GithubException as exc:
@@ -875,6 +1054,10 @@ def run_cmd(
         all_runs.extend(resolved)
         for r in resolved:
             target_state[t]["run_ids"].append(r.id)
+            merged_ignore = list(dict.fromkeys(
+                effective_ignore_ci + list(repo_rules.get("ignore_ci", []))
+            ))
+            run_ignore_ci[r.id] = merged_ignore
             click.echo(f"  + {r.html_url}")
 
     target_state = {k: v for k, v in target_state.items() if v["run_ids"]}
@@ -1074,7 +1257,8 @@ def run_cmd(
                     s["result"] = "success"
 
                 elif conclusion in _RETRY_CONCLUSIONS:
-                    if effective_ignore_ci and _all_failures_ignored(run, effective_ignore_ci):
+                    ignore_list = run_ignore_ci.get(run_id, effective_ignore_ci)
+                    if ignore_list and _all_failures_ignored(run, ignore_list):
                         _event(
                             f"{label} {conclusion} — all failures are in ignored jobs, skipping rerun."
                         )

@@ -71,6 +71,32 @@ gh-rerunner auth
 
 ---
 
+### `gh-rerunner config`
+
+Manage persistent per-repo defaults stored in `~/.gh-rerunner.json`.
+
+```bash
+# Show all saved repo configs
+gh-rerunner config show
+
+# Set defaults for one repo
+gh-rerunner config set --repo owner/repo --ignore-ci lint,build-docs --required-labels release-ready --required-reviews 1
+
+# Show one repo config
+gh-rerunner config show --repo owner/repo
+
+# Remove one repo config
+gh-rerunner config clear --repo owner/repo
+```
+
+Saved fields per repo:
+
+- `ignore_ci`: list of CI job-name substrings to ignore for rerun decisions
+- `required_labels`: list of label substrings required for PR targets
+- `required_reviews`: minimum number of approvals required for PR targets
+
+---
+
 ### `gh-rerunner assigned-prs`
 
 Export all PRs assigned to the authenticated user in the same markdown format used by Backport Tracker.
@@ -156,6 +182,8 @@ gh-rerunner run [OPTIONS] [TARGETS]...
 Notes:
 
 - For PR targets, runs that are already fully successful are skipped automatically.
+- Per-repo defaults from `~/.gh-rerunner.json` are applied automatically in `run`.
+- For PR targets, `required_labels` / `required_reviews` checks are enforced before watching runs.
 - In TTY mode, `gh-rerunner run` uses an overwatch-style Rich TUI dashboard (targets, runs, and live events).
 - When all attempts finish, the CLI prompts next actions (show failures / retry once / quit).
 

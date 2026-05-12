@@ -6,8 +6,10 @@ from types import SimpleNamespace
 import click
 
 from gh_rerunner.cli import (
+    _count_approved_reviews,
     _collect_failed_jobs,
     _format_markdown_summary,
+    _pr_requirements_status,
     _render_context_lines,
 )
 
@@ -58,3 +60,46 @@ def test_collect_failed_jobs_filters_retry_conclusions():
     failed_jobs = _collect_failed_jobs(run)
 
     assert [job.conclusion for job in failed_jobs] == ["failure", "timed_out"]
+
+
+def test_count_approved_reviews_uses_latest_state_per_user():
+    reviews = [
+        SimpleNamespace(user=SimpleNamespace(login="alice"), state="APPROVED"),
+        SimpleNamespace(user=SimpleNamespace(login="bob"), state="COMMENTED"),
+        SimpleNamespace(user=SimpleNamespace(login="alice"), state="CHANGES_REQUESTED"),
+        SimpleNamespace(user=SimpleNamespace(login="carol"), state="APPROVED"),
+    ]
+    pr = SimpleNamespace(get_reviews=lambda: reviews)
+
+    assert _count_approved_reviews(pr) == 1
+
+
+def test_pr_requirements_status_checks_labels_and_reviews():
+    pr = SimpleNamespace(
+        labels=[SimpleNamespace(name="needs-backport"), SimpleNamespace(name="team/ci")],
+        get_reviews=lambda: [
+            SimpleNamespace(user=SimpleNamespace(login="alice"), state="APPROVED"),
+            SimpleNamespace(user=SimpleNamespace(login="bob"), state="APPROVED"),
+        ],
+    )
+    ok, reason = _pr_requirements_status(
+        pr,
+        {"required_labels": ["backport", "team/ci"], "required_reviews": 2},
+    )
+
+    assert ok is True
+    assert reason == "ok"
+
+
+def test_pr_requirements_status_fails_when_missing_label():
+    pr = SimpleNamespace(
+        labels=[SimpleNamespace(name="bugfix")],
+        get_reviews=lambda: [],
+    )
+    ok, reason = _pr_requirements_status(
+        pr,
+        {"required_labels": ["release"], "required_reviews": 0},
+    )
+
+    assert ok is False
+    assert "missing labels" in reason
