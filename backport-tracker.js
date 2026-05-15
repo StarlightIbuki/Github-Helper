@@ -1,11 +1,17 @@
 // ==UserScript==
 // @name         Backport Tracker
 // @namespace    https://github.com/StarlightIbuki
-// @version      1.4
+// @version      1.7
 // @description  Track backport PRs
 // @match        https://github.com/*
 // @connect      github.com
+// @connect      127.0.0.1
+// @connect      localhost
 // @run-at       document-start
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @icon         https://raw.githubusercontent.com/primer/octicons/main/icons/git-pull-request-24.svg
 // @updateURL    https://raw.githubusercontent.com/StarlightIbuki/Github-Helper/main/backport-tracker.js
 // @downloadURL  https://raw.githubusercontent.com/StarlightIbuki/Github-Helper/main/backport-tracker.js
@@ -23,6 +29,11 @@
     const MAX_RETRIES = 10;
     const RESULTS_CACHE_KEY = 'bp_tracker_results_v1';
     const RESULTS_CACHE_TTL_MS = 30 * 60 * 1000;
+    const CI_HISTORY_KEY = 'bp_tracker_ci_history_v1';
+    const CI_HISTORY_MAX_SAMPLES = 40;
+    const CI_MIN_REFRESH_MS = 15000;
+    const CI_MAX_REFRESH_MS = 10 * 60 * 1000;
+    const CI_BATCH_CONCURRENCY = 4;
 
     const OCTICONS = {
         check: '<svg class="octicon octicon-check color-fg-success" viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>',
@@ -44,21 +55,295 @@
         'port(?:ed)?\\s+to\\s+`?([a-zA-Z0-9._\\-\\/]+)`?',
     ];
 
-    // Per-repo config persisted in localStorage.
+    // Per-repo config persisted in GM_setValue/GM_getValue.
     const CONFIG_KEY = 'bp_tracker_cfg_v1';
 
     function getRepoConfig(repo) {
         try {
-            return { excludeCiJobs: [], requiredLabels: [], requiredReviews: 0, commentPatterns: [], refreshInterval: 30000,
-                     ...JSON.parse(localStorage.getItem(CONFIG_KEY) || '{}')[repo] };
-        } catch { return { excludeCiJobs: [], requiredLabels: [], requiredReviews: 0, commentPatterns: [], refreshInterval: 30000 }; }
+            const all = JSON.parse(GM_getValue(CONFIG_KEY, '{}'));
+            return { excludeCiJobs: [], requiredLabels: [], requiredReviews: 0, commentPatterns: [], refreshInterval: 30000, serverUrl: '',
+                     ...(all[repo] || {}) };
+        } catch { return { excludeCiJobs: [], requiredLabels: [], requiredReviews: 0, commentPatterns: [], refreshInterval: 30000, serverUrl: '' }; }
     }
 
     function saveRepoConfig(repo, cfg) {
         try {
-            const all = JSON.parse(localStorage.getItem(CONFIG_KEY) || '{}');
-            localStorage.setItem(CONFIG_KEY, JSON.stringify({ ...all, [repo]: cfg }));
+            const all = JSON.parse(GM_getValue(CONFIG_KEY, '{}'));
+            all[repo] = cfg;
+            GM_setValue(CONFIG_KEY, JSON.stringify(all));
         } catch {}
+    }
+
+    function normalizeServerBaseUrl(input) {
+        const raw = String(input || '').trim() || 'http://127.0.0.1:53210';
+        return raw.replace(/\/+$/, '');
+    }
+
+    async function postJsonCrossOrigin(url, payload) {
+        const body = JSON.stringify(payload);
+
+        if (typeof GM_xmlhttpRequest === 'function') {
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url,
+                    headers: { 'Content-Type': 'application/json' },
+                    data: body,
+                    onload: (resp) => {
+                        if (!resp || resp.status < 200 || resp.status >= 300) {
+                            reject(new Error(`HTTP ${resp?.status ?? 0}`));
+                            return;
+                        }
+                        try {
+                            resolve(JSON.parse(resp.responseText || '{}'));
+                        } catch (e) {
+                            reject(new Error(`Invalid JSON response: ${e.message}`));
+                        }
+                    },
+                    onerror: () => reject(new Error('Network error')),
+                    ontimeout: () => reject(new Error('Request timeout')),
+                });
+            });
+        }
+
+        // Fallback for environments without userscript cross-origin APIs.
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body,
+        });
+        return res.json();
+    }
+
+    async function sendToServer(sessionId = activeSessionId) {
+        const repo = parseGithubUrl(window.location.href)?.repo;
+        const cfg = getRepoConfig(repo);
+        const serverUrl = normalizeServerBaseUrl(cfg.serverUrl);
+
+        const targets = backportData
+            .filter(pr => !pr.skipStatusCheck)
+            .map(pr => pr.url)
+            .filter(Boolean);
+
+        if (targets.length === 0) {
+            alert('No backport PR URLs to send.');
+            return;
+        }
+
+        const targetsText = targets.join('\n');
+
+        const btn = document.getElementById('backport-send-btn');
+        const origLabel = btn ? btn.textContent : '';
+        if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+
+        try {
+            const data = await postJsonCrossOrigin(`${serverUrl}/rpc`, {
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'trackerAddTargets',
+                params: { targets_text: targetsText, auto_rerun: true },
+            });
+            if (data.error) {
+                alert(`Server error: ${data.error.message || JSON.stringify(data.error)}`);
+            } else {
+                const added = data.result?.added ?? data.result?.trackers?.length ?? targets.length;
+                if (btn) { btn.textContent = `✓ ${added} sent`; }
+                setTimeout(() => { if (btn && sessionId === activeSessionId) { btn.disabled = false; btn.textContent = origLabel; } }, 3000);
+                return;
+            }
+        } catch (e) {
+            const hint = [
+                `Failed to reach server at ${serverUrl}/rpc: ${e.message}`,
+                '',
+                'Configuration hint:',
+                '1) Start gh-rerunner with --serve (default: 127.0.0.1:53210).',
+                '2) In Backport Tracker settings (gear) -> Advanced -> gh-rerunner server URL,',
+                '   set the exact host:port (e.g. http://127.0.0.1:53210).',
+            ].join('\n');
+            alert(hint);
+        }
+
+        if (btn) { btn.disabled = false; btn.textContent = origLabel; }
+    }
+
+    function getSummaryTextForExport(pr) {
+        if (pr.merged) return 'Merged';
+        if (pr.closed) return 'Closed';
+
+        const tooltip = (pr.tooltip || '').toLowerCase();
+        const parts = [];
+
+        const reviewMatch = tooltip.match(/(\d+)\/(\d+)\s+required approval\(s\)/i);
+        if (reviewMatch) {
+            const have = Number(reviewMatch[1]);
+            const need = Number(reviewMatch[2]);
+            const missing = Math.max(need - have, 0);
+            if (missing > 0) parts.push(`${missing} Review required`);
+        }
+
+        const labelMatch = tooltip.match(/(\d+)\/(\d+)\s+required label\(s\)/i);
+        if (labelMatch) {
+            const have = Number(labelMatch[1]);
+            const need = Number(labelMatch[2]);
+            const missing = Math.max(need - have, 0);
+            if (missing > 0) parts.push(`${missing} label required`);
+        }
+
+        if (pr.ciStatus === 'test_fail' || /\b\d+\s+failed\b/i.test(tooltip)) parts.push('CI failed');
+        else if (pr.ciStatus === 'pending' || pr.ciStatus === 'fetching' || /\b\d+\s+running\b/i.test(tooltip)) parts.push('CI pending');
+        else if (pr.ciStatus === 'error') parts.push('CI unavailable');
+        else if (pr.ciStatus === 'success') parts.push('CI passed');
+
+        if (parts.length === 0) return (pr.tooltip || 'Open').replace(/\s+/g, ' ').trim();
+        return parts.join('; ');
+    }
+
+    function buildBackportSummaryMarkdown() {
+        const parsedCurrent = parseGithubUrl(window.location.href);
+        const cfg = getRepoConfig(parsedCurrent?.repo);
+        const lines = [];
+        const title = getCurrentPrTitle();
+        const prNum = parsedCurrent?.prNumber || '?';
+        lines.push(`# Backport PRs for [${escapeMarkdownText(`${title} #${prNum}`)}](${window.location.href})`);
+
+        const metaAttrs = [];
+        metaAttrs.push(`format="2"`);
+        const sourcePrDescription = extractOriginalPrDescription();
+        if (cfg.excludeCiJobs && cfg.excludeCiJobs.filter(j => j).length > 0) {
+            metaAttrs.push(`ignore_ci="${escapeMetaValue(cfg.excludeCiJobs.filter(j => j).join(','))}"`);
+        }
+        lines.push(``);
+        if (sourcePrDescription) {
+            sourcePrDescription.split(/\r?\n/).forEach(line => {
+                lines.push(`> ${escapeMarkdownText(line)}`);
+            });
+        }
+        lines.push(...backportData.map(pr => `- [${pr.branch}](${pr.url}) ${getSummaryTextForExport(pr)}`));
+        return lines.join('\n');
+    }
+
+    function _readCiHistory() {
+        try {
+            const raw = JSON.parse(GM_getValue(CI_HISTORY_KEY, '{}'));
+            return raw && typeof raw === 'object' ? raw : {};
+        } catch {
+            return {};
+        }
+    }
+
+    function _writeCiHistory(data) {
+        try {
+            GM_setValue(CI_HISTORY_KEY, JSON.stringify(data));
+        } catch {}
+    }
+
+    function _repoHistorySamples(repo) {
+        const all = _readCiHistory();
+        const samples = all?.[repo]?.samples;
+        return Array.isArray(samples) ? samples.filter(v => Number.isFinite(v) && v > 0) : [];
+    }
+
+    function _recordRepoHistorySample(repo, ms) {
+        if (!repo || !Number.isFinite(ms) || ms <= 0) return;
+        const all = _readCiHistory();
+        const prev = Array.isArray(all?.[repo]?.samples) ? all[repo].samples : [];
+        const next = [...prev, Math.round(ms)].slice(-CI_HISTORY_MAX_SAMPLES);
+        all[repo] = { samples: next, updatedAt: Date.now() };
+        _writeCiHistory(all);
+    }
+
+    function _median(values) {
+        if (!values.length) return null;
+        const sorted = [...values].sort((a, b) => a - b);
+        const mid = Math.floor(sorted.length / 2);
+        return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
+    }
+
+    function _isTerminalCiStatus(status) {
+        return ['success', 'test_fail', 'error', 'closed'].includes(String(status || '').toLowerCase());
+    }
+
+    function _isActiveCiStatus(status) {
+        return ['pending', 'fetching'].includes(String(status || '').toLowerCase());
+    }
+
+    function _trackCiTiming(repo, pr) {
+        if (!repo || !pr || pr.skipStatusCheck) return;
+        const now = Date.now();
+        if (_isActiveCiStatus(pr.ciStatus)) {
+            if (!pr._pendingSince) pr._pendingSince = now;
+            return;
+        }
+        if (pr._pendingSince && _isTerminalCiStatus(pr.ciStatus)) {
+            _recordRepoHistorySample(repo, now - pr._pendingSince);
+            delete pr._pendingSince;
+        }
+    }
+
+    function _computeAdaptiveRefreshMs(repo, cfgMs) {
+        const base = Math.max(CI_MIN_REFRESH_MS, Number(cfgMs) || 30000);
+        const activeCount = backportData.filter(pr => !pr.skipStatusCheck && !pr.merged && !pr.closed && !['success', 'test_fail'].includes(pr.ciStatus)).length;
+        if (activeCount === 0) return base;
+
+        const medianMs = _median(_repoHistorySamples(repo));
+        let factor = 1.5;
+        if (medianMs != null) {
+            if (medianMs >= 45 * 60 * 1000) factor = 4;
+            else if (medianMs >= 20 * 60 * 1000) factor = 3;
+            else if (medianMs >= 10 * 60 * 1000) factor = 2;
+        }
+        if (activeCount >= 8) factor += 0.5;
+        if (activeCount >= 15) factor += 0.5;
+
+        return Math.max(base, Math.min(CI_MAX_REFRESH_MS, Math.round(base * factor)));
+    }
+
+    function _computeNextPollDelayMs(repo, pr, cfgMs) {
+        const adaptiveBase = _computeAdaptiveRefreshMs(repo, cfgMs);
+        const status = String(pr?.ciStatus || '').toLowerCase();
+        if (status === 'pending' || status === 'fetching') return adaptiveBase;
+        if (status === 'review_required' || status === 'label_required') return Math.min(CI_MAX_REFRESH_MS, Math.max(adaptiveBase * 2, 120000));
+        if (status === 'test_fail') return Math.min(CI_MAX_REFRESH_MS, Math.max(adaptiveBase * 2, 180000));
+        if (status === 'error') return Math.min(CI_MAX_REFRESH_MS, Math.max(adaptiveBase * 2, 90000));
+        return adaptiveBase;
+    }
+
+    function _shouldPollNow(pr, now) {
+        if (!pr || pr.skipStatusCheck || pr.merged || pr.closed || pr.ciStatus === 'success') return false;
+        return !pr._nextPollAt || now >= pr._nextPollAt;
+    }
+
+    async function _mapWithConcurrency(items, limit, mapper) {
+        const out = new Array(items.length);
+        let next = 0;
+        const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+            while (true) {
+                const idx = next;
+                next += 1;
+                if (idx >= items.length) break;
+                out[idx] = await mapper(items[idx], idx);
+            }
+        });
+        await Promise.all(workers);
+        return out;
+    }
+
+    async function _fetchPrStatusesBatch(prItems, sessionId) {
+        const work = prItems
+            .map(pr => ({ pr, parsed: parseGithubUrl(pr.url) }))
+            .filter(it => it.parsed);
+
+        const rows = await _mapWithConcurrency(work, CI_BATCH_CONCURRENCY, async ({ pr, parsed }) => {
+            const info = await getPrStatus(parsed.repo, parsed.prNumber);
+            return { pr, repo: parsed.repo, info };
+        });
+
+        if (sessionId !== activeSessionId) return;
+
+        rows.forEach(({ pr, repo, info }) => {
+            Object.assign(pr, info);
+            _trackCiTiming(repo, pr);
+        });
     }
 
     function getCurrentPrCacheKey() {
@@ -77,7 +362,7 @@
         const key = getCurrentPrCacheKey();
         if (!key) return null;
         try {
-            const all = JSON.parse(localStorage.getItem(RESULTS_CACHE_KEY) || '{}');
+            const all = JSON.parse(GM_getValue(RESULTS_CACHE_KEY, '{}'));
             const entry = all[key];
             if (!entry || !Array.isArray(entry.data) || !entry.ts) return null;
             if (Date.now() - entry.ts > RESULTS_CACHE_TTL_MS) return null;
@@ -91,7 +376,7 @@
         const key = cacheKey || getCurrentPrCacheKey();
         if (!key) return;
         try {
-            const all = JSON.parse(localStorage.getItem(RESULTS_CACHE_KEY) || '{}');
+            const all = JSON.parse(GM_getValue(RESULTS_CACHE_KEY, '{}'));
             const snapshot = backportData.map(pr => ({
                 branch: pr.branch || '',
                 url: pr.url || '',
@@ -103,7 +388,9 @@
                 tooltip: pr.tooltip || '',
                 state: pr.state || '',
                 skipStatusCheck: !!pr.skipStatusCheck,
-                customText: pr.customText || ''
+                customText: pr.customText || '',
+                _nextPollAt: Number(pr._nextPollAt) || 0,
+                _pendingSince: Number(pr._pendingSince) || 0
             }));
             all[key] = { ts: Date.now(), data: snapshot };
 
@@ -116,7 +403,7 @@
                 });
             }
 
-            localStorage.setItem(RESULTS_CACHE_KEY, JSON.stringify(all));
+            GM_setValue(RESULTS_CACHE_KEY, JSON.stringify(all));
         } catch {}
     }
 
@@ -408,23 +695,26 @@
 
         try {
             isScanning = true;
-            for (const pr of backportData) {
-                if (sessionId !== activeSessionId) return;
-                if (pr.skipStatusCheck || pr.merged || pr.closed || pr.ciStatus === 'success') {
-                    continue;
-                }
+            const currentRepo = parseGithubUrl(window.location.href)?.repo;
+            const cfgMs = currentRepo ? (getRepoConfig(currentRepo).refreshInterval ?? 30000) : 30000;
+            const now = Date.now();
+            const due = backportData.filter(pr => _shouldPollNow(pr, now));
 
-                const parsed = parseGithubUrl(pr.url);
-                if (parsed) {
-                    pr.ciStatus = 'fetching';
-                    renderListUI(sessionId);
+            if (due.length === 0) return;
 
-                    const info = await getPrStatus(parsed.repo, parsed.prNumber);
-                    if (sessionId !== activeSessionId) return;
-                    Object.assign(pr, info);
-                    renderListUI(sessionId);
-                }
-            }
+            due.forEach(pr => { pr.ciStatus = 'fetching'; });
+            renderListUI(sessionId);
+
+            await _fetchPrStatusesBatch(due, sessionId);
+            if (sessionId !== activeSessionId) return;
+
+            const scheduledAt = Date.now();
+            due.forEach(pr => {
+                const repo = parseGithubUrl(pr.url)?.repo || currentRepo;
+                const delay = _computeNextPollDelayMs(repo, pr, cfgMs);
+                pr._nextPollAt = scheduledAt + delay;
+            });
+            renderListUI(sessionId);
         } finally {
             if (sessionId === activeSessionId) isScanning = false;
             if (btn) btn.querySelector('svg').classList.remove('anim-rotate');
@@ -432,9 +722,36 @@
     }
 
     function startAutoRefresh(repo) {
-        if (refreshIntervalId) clearInterval(refreshIntervalId);
-        const ms = getRepoConfig(repo).refreshInterval ?? 30000;
-        refreshIntervalId = ms > 0 ? setInterval(() => triggerRefresh(), ms) : null;
+        if (refreshIntervalId) {
+            clearTimeout(refreshIntervalId);
+            refreshIntervalId = null;
+        }
+
+        const cfgMs = getRepoConfig(repo).refreshInterval ?? 30000;
+        if (!(cfgMs > 0)) return;
+
+        const scheduleNext = () => {
+            if (parseGithubUrl(window.location.href)?.repo !== repo) return;
+            const delay = _computeAdaptiveRefreshMs(repo, cfgMs);
+            refreshIntervalId = setTimeout(async () => {
+                await triggerRefresh(activeSessionId);
+                scheduleNext();
+            }, delay);
+        };
+
+        scheduleNext();
+    }
+
+    function _primePollingState(repo) {
+        if (!repo) return;
+        const now = Date.now();
+        const cfgMs = getRepoConfig(repo).refreshInterval ?? 30000;
+        backportData.forEach(pr => {
+            _trackCiTiming(repo, pr);
+            if (!Number(pr._nextPollAt)) {
+                pr._nextPollAt = now + _computeNextPollDelayMs(repo, pr, cfgMs);
+            }
+        });
     }
 
     // Finds backport PRs linked in comments. Uses custom regex patterns from repo config if set,
@@ -504,6 +821,7 @@
             const cached = loadCachedBackportData();
             if (cached && cached.length > 0) {
                 backportData = cached;
+                _primePollingState(currentRepoData.repo);
                 renderListUI(sessionId);
                 return;
             }
@@ -555,16 +873,10 @@
             if (sessionId !== activeSessionId) return;
             renderListUI(sessionId);
 
-            for (const pr of backportData) {
-                if (sessionId !== activeSessionId) return;
-                const parsed = parseGithubUrl(pr.url);
-                if (parsed) {
-                    const info = await getPrStatus(parsed.repo, parsed.prNumber);
-                    if (sessionId !== activeSessionId) return;
-                    Object.assign(pr, info);
-                    renderListUI(sessionId);
-                }
-            }
+            await _fetchPrStatusesBatch(backportData, sessionId);
+            if (sessionId !== activeSessionId) return;
+            _primePollingState(currentRepoData.repo);
+            renderListUI(sessionId);
         } else if (retryCount < MAX_RETRIES) {
             setTimeout(() => attemptAutoScan(retryCount + 1, sessionId), 1000);
         } else {
@@ -621,66 +933,29 @@
         if (backportData.length > 0) saveCachedBackportData(currentPrCacheKey);
 
         if (!backportData.some(pr => pr.skipStatusCheck)) {
-            function getSummaryTextFromHover(pr) {
-                if (pr.merged) return 'Merged';
-                if (pr.closed) return 'Closed';
+            const actionBar = document.createElement('div');
+            actionBar.className = 'mt-2';
+            actionBar.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:6px;';
 
-                const tooltip = (pr.tooltip || '').toLowerCase();
-                const parts = [];
-
-                const reviewMatch = tooltip.match(/(\d+)\/(\d+)\s+required approval\(s\)/i);
-                if (reviewMatch) {
-                    const have = Number(reviewMatch[1]);
-                    const need = Number(reviewMatch[2]);
-                    const missing = Math.max(need - have, 0);
-                    if (missing > 0) parts.push(`${missing} Review required`);
-                }
-
-                const labelMatch = tooltip.match(/(\d+)\/(\d+)\s+required label\(s\)/i);
-                if (labelMatch) {
-                    const have = Number(labelMatch[1]);
-                    const need = Number(labelMatch[2]);
-                    const missing = Math.max(need - have, 0);
-                    if (missing > 0) parts.push(`${missing} label required`);
-                }
-
-                if (pr.ciStatus === 'test_fail' || /\b\d+\s+failed\b/i.test(tooltip)) parts.push('CI failed');
-                else if (pr.ciStatus === 'pending' || pr.ciStatus === 'fetching' || /\b\d+\s+running\b/i.test(tooltip)) parts.push('CI pending');
-                else if (pr.ciStatus === 'error') parts.push('CI unavailable');
-                else if (pr.ciStatus === 'success') parts.push('CI passed');
-
-                if (parts.length === 0) return (pr.tooltip || 'Open').replace(/\s+/g, ' ').trim();
-                return parts.join('; ');
-            }
+            const sendBtn = document.createElement('button');
+            sendBtn.id = 'backport-send-btn';
+            sendBtn.className = "btn btn-sm";
+            sendBtn.style.cssText = "font-size:11px;height:28px;display:inline-flex;align-items:center;justify-content:center;gap:4px;background:var(--color-btn-primary-bg,#1f883d);color:var(--color-btn-primary-text,#fff);border-color:var(--color-btn-primary-border,#1f883d);";
+            sendBtn.innerHTML = `<span>Watch on server</span>`;
+            sendBtn.title = "Send all backport PR URLs to the gh-rerunner server via RPC";
+            sendBtn.onclick = () => sendToServer(sessionId);
+            actionBar.appendChild(sendBtn);
 
             const btn = document.createElement('button');
-            btn.className = "btn btn-sm btn-block mt-2";
-            btn.style.fontSize = "11px";
-            btn.textContent = "Copy summary";
+            btn.className = "btn btn-sm";
+            btn.style.cssText = "font-size:11px;height:28px;display:inline-flex;align-items:center;justify-content:center;gap:4px;";
+            btn.innerHTML = `<span>Copy summary</span>`;
             btn.onclick = () => {
-                const parsedCurrent = parseGithubUrl(window.location.href);
-                const cfg = getRepoConfig(parsedCurrent?.repo);
-                const lines = [];
-                const title = getCurrentPrTitle();
-                const prNum = parsedCurrent?.prNumber || '?';
-                lines.push(`# Backport PRs for [${escapeMarkdownText(`${title} #${prNum}`)}](${window.location.href})`);
-
-                const metaAttrs = [];
-                metaAttrs.push(`format="2"`);
-                const sourcePrDescription = extractOriginalPrDescription();
-                if (cfg.excludeCiJobs && cfg.excludeCiJobs.filter(j => j).length > 0) {
-                    metaAttrs.push(`ignore_ci="${escapeMetaValue(cfg.excludeCiJobs.filter(j => j).join(','))}"`);
-                }
-                lines.push(`<!-- gh-rerunner: ${metaAttrs.join(' ')} -->`);
-                if (sourcePrDescription) {
-                    sourcePrDescription.split(/\r?\n/).forEach(line => {
-                        lines.push(`> ${escapeMarkdownText(line)}`);
-                    });
-                }
-                lines.push(...backportData.map(pr => `- [${pr.branch}](${pr.url}) ${getSummaryTextFromHover(pr)}`));
-                navigator.clipboard.writeText(lines.join('\n'));
+                navigator.clipboard.writeText(buildBackportSummaryMarkdown());
             };
-            root.appendChild(btn);
+            actionBar.appendChild(btn);
+
+            root.appendChild(actionBar);
         }
     }
 
@@ -735,6 +1010,8 @@
                             <div class="text-small text-bold color-fg-muted mb-1">Comment scan patterns</div>
                             <div class="text-small color-fg-muted mb-1">One capture group = branch name. Defaults shown — edit to override.</div>
                             <textarea id="bp-cfg-patterns" rows="4" class="form-control input-sm" autocomplete="off" style="${TA_STYLE}"></textarea>
+                            <div class="text-small text-bold color-fg-muted mt-3 mb-1">gh-rerunner server URL</div>
+                            <input id="bp-cfg-server-url" type="url" class="form-control input-sm" placeholder="http://127.0.0.1:53210" autocomplete="off" style="width:100%;">
                         </div>
                     </details>
                 </div>
@@ -774,6 +1051,7 @@
                 requiredReviews: parseInt(document.getElementById('bp-cfg-reviews').value, 10) || 0,
                 commentPatterns: isDefaultPatterns ? [] : rawPatterns,
                 refreshInterval: parseInt(document.getElementById('bp-cfg-refresh').value, 10) || 0,
+                serverUrl: (document.getElementById('bp-cfg-server-url').value || '').trim(),
             });
             updateSettingsBtnTitle(repo);
             startAutoRefresh(repo);
@@ -800,6 +1078,7 @@
                 document.getElementById('bp-cfg-patterns').value = cfg.commentPatterns.length
                     ? cfg.commentPatterns.join('\n')
                     : BUILTIN_PATTERN_STRS.join('\n');
+                document.getElementById('bp-cfg-server-url').value = cfg.serverUrl || '';
             }
             settingsPanel.style.display = 'block';
             setTimeout(() => document.addEventListener('click', outsideClickHandler), 0);
@@ -810,7 +1089,7 @@
         });
 
         // Auto-save on every field change (fires when focus leaves a modified field)
-        ['bp-cfg-refresh', 'bp-cfg-exclude-jobs', 'bp-cfg-labels', 'bp-cfg-reviews', 'bp-cfg-patterns'].forEach(id => {
+        ['bp-cfg-refresh', 'bp-cfg-exclude-jobs', 'bp-cfg-labels', 'bp-cfg-reviews', 'bp-cfg-patterns', 'bp-cfg-server-url'].forEach(id => {
             document.getElementById(id).addEventListener('change', doAutoSave);
         });
 
@@ -833,7 +1112,7 @@
         activeSessionId += 1;
         backportData = [];
         isScanning = false;
-        if (refreshIntervalId) { clearInterval(refreshIntervalId); refreshIntervalId = null; }
+        if (refreshIntervalId) { clearTimeout(refreshIntervalId); refreshIntervalId = null; }
         const oldWidget = document.getElementById('backport-tracker-section');
         if (oldWidget) oldWidget.remove();
     }
@@ -873,4 +1152,17 @@
 
     observer.observe(document.documentElement, { childList: true, subtree: true });
     bootstrapIfNeeded();
+
+    // Register standard Userscript extension menu commands
+    if (typeof GM_registerMenuCommand === 'function') {
+        GM_registerMenuCommand('Open Backport Settings', () => {
+            const settingsBtn = document.getElementById('backport-settings-btn');
+            if (settingsBtn) {
+                settingsBtn.click();
+            } else {
+                alert('Please navigate to a Pull Request page to open Backport settings.');
+            }
+        });
+    }
+
 })();
