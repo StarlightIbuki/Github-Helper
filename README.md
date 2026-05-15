@@ -1,8 +1,13 @@
-# GitHub Helper Userscripts
+# GitHub Helper
 
-A collection of Tampermonkey userscripts that add quality-of-life features to GitHub.
+A toolkit for tracking and managing backport PRs and CI reruns on GitHub. It consists of:
 
-## Scripts
+- **[backport-tracker.js](backport-tracker.js)** — a Tampermonkey userscript that adds a Backports panel to GitHub PR pages, tracking CI and approval status across all backport branches.
+- **[server-rerunner/](server-rerunner/)** — a Python server (`gh-rerunner`) that polls GitHub Actions and retries failed jobs automatically. Comes with a **web UI** for managing targets and viewing live status from any browser, a Rich TUI for local use, and an HTTP/JSON-RPC interface for automation.
+
+The two components are designed to work together: the userscript surfaces status and generates structured summaries; the server consumes them and drives reruns headlessly.
+
+## Userscript
 
 ### [backport-tracker.js](backport-tracker.js) — Backport Tracker
 
@@ -33,6 +38,7 @@ Injects a **Backports** panel into the PR sidebar that automatically finds and t
   - **Required label** — label name substring that must be present on the PR.
   - **Required review approvals** — minimum number of approved reviews required.
   - All three fields are optional and independent; set only what your repo uses.
+- **Watch on server** button — appears when `gh-rerunner` is detected running locally (default: `127.0.0.1:53210`). Sends all PR URLs and `ignore_ci` settings to the server via a single RPC call.
 - **Copy summary** — copies a markdown summary to the clipboard:
   ```
   # Backport PRs for "Fix: clustering syncing issue" #3125
@@ -51,70 +57,70 @@ Injects a **Backports** panel into the PR sidebar that automatically finds and t
 
 ---
 
-### [rerunner.js](rerunner.js) — GitHub Actions Auto-Rerunner
-
-Adds a persistent **Start auto-retry** button to GitHub Actions run pages that automatically re-runs failed jobs up to a configurable limit.
-
-**How it works:**
-
-Uses a `MutationObserver` to watch the run status badge in real time. When a failure is detected, it clicks through the "Re-run failed jobs" dialog automatically.
-
-**Controls injected into the toolbar:**
-
-- **Start / Stop** toggle button — enables or disables the watcher.
-- **Counter** (`N/max`) — shows current retry count over the limit. Click the count to reset it.
-- **Limit** — click the max number to edit it inline.
-
-State (retry count, limit, running/stopped) is persisted per run ID in `localStorage`, so it survives page refreshes.
-
----
-
 ## Installation
 
 1. Install the [Tampermonkey](https://www.tampermonkey.net/) browser extension.
-2. Click one of the install links below to open the script directly in Tampermonkey:
+2. Click the install link below to open the script directly in Tampermonkey:
    - [Install Backport Tracker](https://raw.githubusercontent.com/StarlightIbuki/Github-Helper/main/backport-tracker.js)
-   - [Install Auto-Rerunner](https://raw.githubusercontent.com/StarlightIbuki/Github-Helper/main/rerunner.js)
 3. Click **Install** in the Tampermonkey dialog.
 
 ## Auto-Update
 
-Both scripts include `@updateURL` and `@downloadURL` headers pointing to this repository. Tampermonkey will check for updates automatically based on your configured update interval (default: once a day). You can also trigger a manual check via **Tampermonkey Dashboard → Check for updates**.
+The script includes `@updateURL` and `@downloadURL` headers pointing to this repository. Tampermonkey will check for updates automatically based on your configured update interval (default: once a day). You can also trigger a manual check via **Tampermonkey Dashboard → Check for updates**.
 
 Version bumps in the `@version` header are what trigger the update prompt.
 
 ---
 
-## Headless CI Rerunner (`server-rerunner/`)
+## CI Rerunner (`server-rerunner/`)
 
-For running CI reruns on a server without a browser, see [`server-rerunner/`](server-rerunner/) — a Python CLI that polls the GitHub API and retries failed jobs automatically.
+[`server-rerunner/`](server-rerunner/) is a Python server that polls GitHub Actions and retries failed jobs automatically — **no browser required**. It can run continuously on a server, keeping CI moving even when your laptop is off.
 
-**New commands:**
-- `gh-rerunner assigned-prs` — export all assigned PRs in backport-tracker format
-- `gh-rerunner failed-logs` — fetch failed job logs with optional regex filtering and context highlighting
+**Key commands:**
 
-See [`server-rerunner/README.md`](server-rerunner/README.md) for full documentation.
+| Command | What it does |
+|---|---|
+| `gh-rerunner watch [TARGETS]...` | Start the supervisor: auto-rerun engine, TUI, and optional web UI + HTTP server |
+| `gh-rerunner ls` | Export assigned PRs in Backport-Tracker-compatible markdown |
+| `gh-rerunner logs [TARGETS]...` | Print failed-job logs (`--grep` to filter) |
+| `gh-rerunner auth` | Authenticate via GitHub device flow (or `--pat` for PAT) |
+| `gh-rerunner config set/show/clear` | Manage per-repo defaults |
+
+### Recommended workflow
+
+1. **Start the server once** on any always-on machine:
+   ```bash
+   gh-rerunner watch --serve --no-tui --host 0.0.0.0
+   ```
+   Trackers persist across restarts in `~/.gh-rerunner-trackers.json`.
+
+2. **Open the web UI** at `http://<host>:53210/` from any browser to see live CI status, add or remove targets, and trigger reruns manually. No terminal access needed after the server is running.
+
+3. **Add targets** from the web UI directly, or pipe a Backport Tracker summary from your laptop:
+   ```bash
+   pbpaste | gh-rerunner watch
+   ```
+
+4. The server polls GitHub every 30 s (configurable), retries failed jobs automatically up to the configured limit, and keeps the web UI updated in real time.
 
 ### Backport Tracker → gh-rerunner workflow
 
 1. Open your merged main-branch PR and let the Backport Tracker load all statuses.
 2. Configure **Ignore CI job** in ⚙ Settings if your repo has jobs that are flaky or irrelevant (e.g. `lint`, `build-docs`).
-3. Click **Copy summary**. The clipboard now contains a block like:
+3. Click **Copy summary**. The clipboard will contain a block like:
    ```
-  # Backport PRs for "Fix: clustering syncing issue" #3125
-  <!-- gh-rerunner: format="2" source_pr="https://github.com/owner/repo/pull/3125" source_pr_description_b64="..." ignore_ci="lint,build-docs" -->
-  - [next/3.10.x](https://github.com/owner/repo/pull/100) Merged
-  - [next/3.11.x](https://github.com/owner/repo/pull/101) Merged
-  - [next/3.12.x](https://github.com/owner/repo/pull/102) CI pending
-  - [next/3.13.x](https://github.com/owner/repo/pull/103) CI failed
+   # Backport PRs for "Fix: clustering syncing issue" #3125
+   <!-- gh-rerunner: format="2" source_pr="https://github.com/owner/repo/pull/3125" source_pr_description_b64="..." ignore_ci="lint,build-docs" -->
+   - [next/3.10.x](https://github.com/owner/repo/pull/100) Merged
+   - [next/3.11.x](https://github.com/owner/repo/pull/101) Merged
+   - [next/3.12.x](https://github.com/owner/repo/pull/102) CI pending
+   - [next/3.13.x](https://github.com/owner/repo/pull/103) CI failed
    ```
-4. Pipe it to `gh-rerunner run` on your server (or locally):
-   ```bash
-   pbpaste | gh-rerunner run
-   ```
-  - `Merged` entries are skipped automatically.
-  - `CI pending` entries emit a warning but are still watched.
-  - The `ignore_ci` metadata is read automatically — no extra flags needed.
-   - Failed jobs whose names match an ignored pattern are not retried.
+4. Click **Watch on server** in the Backport Tracker sidebar. If `gh-rerunner` is running (default: `127.0.0.1:53210`), the userscript sends all PR URLs and the `ignore_ci` directive directly to the server via a single RPC call — no copy-paste needed.
+5. The web UI shows live status for every tracked PR and run. Failed jobs are retried automatically; you can also trigger a manual rerun from the UI.
+   - `Merged` entries are skipped automatically.
+   - `CI pending` entries are watched until they settle.
 
-See [`server-rerunner/README.md`](server-rerunner/README.md) for installation, token setup, and full CLI reference.
+   > **Alternative:** Click **Copy summary** and paste it into the server's web UI add-targets box, or pipe it from the CLI: `pbpaste | gh-rerunner watch`.
+
+See [`server-rerunner/README.md`](server-rerunner/README.md) for installation, authentication, and the full CLI reference.
