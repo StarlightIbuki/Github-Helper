@@ -1,11 +1,38 @@
 # GitHub Helper
 
-A toolkit for tracking and managing backport PRs and CI reruns on GitHub. It consists of:
+A toolkit for tracking and managing backport PRs and CI reruns on GitHub. 
 
-- **[backport-tracker.js](backport-tracker.js)** — a Tampermonkey userscript that adds a Backports panel to GitHub PR pages, tracking CI and approval status across all backport branches.
-- **[server-rerunner/](server-rerunner/)** — a Python server (`gh-rerunner`) that polls GitHub Actions and retries failed jobs automatically. Comes with a **web UI** for managing targets and viewing live status from any browser, a Rich TUI for local use, and an HTTP/JSON-RPC interface for automation.
+## Quick Start
 
-The two components are designed to work together: the userscript surfaces status and generates structured summaries; the server consumes them and drives reruns headlessly.
+### 1 — Install the userscript
+
+[**→ Install Backport Tracker**](https://raw.githubusercontent.com/StarlightIbuki/Github-Helper/main/backport-tracker.js) *(requires [Tampermonkey](https://www.tampermonkey.net/))*
+
+Click the link above and confirm **Install** in the Tampermonkey dialog.
+
+### 2 — Install and start the server (Optional and recommended)
+
+```bash
+pipx install "gh-rerunner @ git+https://github.com/StarlightIbuki/Github-Helper.git#subdirectory=server-rerunner"
+```
+
+> `pipx` installs the CLI into an isolated environment. Install it with `brew install pipx` (macOS), `apt install pipx` (Debian/Ubuntu), or `pip install pipx`.
+
+Then authenticate and start:
+
+```bash
+gh-rerunner auth                                          # one-time login via browser
+caffeinate -i gh-rerunner watch --serve --no-tui \
+  --host 0.0.0.0                                          # macOS — keeps machine awake
+```
+
+The web UI is now at **http://localhost:53210/**.
+
+### 3 — Send backport PRs to the server
+
+Open any merged PR on GitHub. The Backport Tracker sidebar will show a **Watch on server** button — click it to push all backport URLs to the running server in one RPC call. Done.
+
+---
 
 ## Userscript
 
@@ -88,10 +115,26 @@ Version bumps in the `@version` header are what trigger the update prompt.
 
 ### Recommended workflow
 
-1. **Start the server once** on any always-on machine:
+1. **Start the server once** on an always-on machine and keep it running:
+
+   **macOS** — use `caffeinate` to prevent the machine from sleeping:
    ```bash
+   caffeinate -i gh-rerunner watch --serve --no-tui --host 0.0.0.0
+   ```
+
+   **Linux** — inhibit sleep with `systemd-inhibit`:
+   ```bash
+   systemd-inhibit --what=sleep gh-rerunner watch --serve --no-tui --host 0.0.0.0
+   ```
+
+   **Windows** — keep-awake with PowerShell before launching:
+   ```powershell
+   powercfg /change standby-timeout-ac 0
    gh-rerunner watch --serve --no-tui --host 0.0.0.0
    ```
+
+   **Alternatively**, run on a remote server where hibernation is not a concern — see [`server-rerunner/README.md`](server-rerunner/README.md) for a `nohup` example.
+
    Trackers persist across restarts in `~/.gh-rerunner-trackers.json`.
 
 2. **Open the web UI** at `http://<host>:53210/` from any browser to see live CI status, add or remove targets, and trigger reruns manually. No terminal access needed after the server is running.
