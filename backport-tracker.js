@@ -26,6 +26,10 @@
     let isScanning = false;
     let refreshIntervalId = null;
     let activeSessionId = 0;
+    // Tracks whether the default server (127.0.0.1:53210) responded to a probe.
+    // Reset on each navigation so a newly started server is detected.
+    let _defaultServerAvailable = false;
+    let _defaultServerProbed = false;
     const MAX_RETRIES = 10;
     const RESULTS_CACHE_KEY = 'bp_tracker_results_v1';
     const RESULTS_CACHE_TTL_MS = 30 * 60 * 1000;
@@ -328,8 +332,133 @@
         return out;
     }
 
+    // Probe the default server URL to check reachability.
+    // On success, marks _defaultServerAvailable = true and re-renders so the
+    // "Watch on server" button appears without the user having to set a URL.
+    async function _probeDefaultServer(sessionId) {
+        if (_defaultServerProbed) return;
+        _defaultServerProbed = true;
+        try {
+            const resp = await postJsonCrossOrigin('http://127.0.0.1:53210/rpc', {
+                jsonrpc: '2.0', id: 1,
+                method: 'cacheInfo',
+                params: {},
+            });
+            if (!resp.error && resp.result) {
+                _defaultServerAvailable = true;
+                renderListUI(sessionId);
+            }
+        } catch (e) {
+            _defaultServerAvailable = false;
+        }
+    }
+
+    // Map a server tracker object to the client PR status format.
+    // Returns null when the tracker has no data yet (caller should fall back to scraping).
+    function mapTrackerToStatus(tracker, repoConfig) {
+        const detail = tracker.last_detail || '';
+        const detailLower = detail.toLowerCase();
+
+        let merged = false, closed = false, ciStatus;
+
+        if (detailLower === 'merged') {
+            merged = true; ciStatus = 'success';
+        } else if (detailLower === 'closed') {
+            closed = true; ciStatus = 'closed';
+        } else if (detailLower === 'ci passed') {
+            ciStatus = 'success';
+        } else if (detailLower === 'ci failed') {
+            ciStatus = 'test_fail';
+        } else if (detailLower === 'ci pending') {
+            ciStatus = 'pending';
+        } else if (!detail) {
+            return null; // no data yet — caller falls back to scraping
+        } else {
+            ciStatus = 'error';
+        }
+
+        // Apply review/label conditions using server repo config
+        if (!merged && !closed && ciStatus !== 'test_fail' && repoConfig) {
+            const isBackport = !!tracker.is_backport;
+            const reqReviews = isBackport
+                ? (repoConfig.backport_required_reviews || 0)
+                : (repoConfig.required_reviews || 0);
+            const reqLabels = isBackport
+                ? (repoConfig.backport_required_labels || [])
+                : (repoConfig.required_labels || []);
+            const approvals = tracker.approvals || 0;
+            const presentLabels = (tracker.labels || []).map(l => l.toLowerCase());
+            const missingLabels = reqLabels.filter(r => !presentLabels.some(l => l.includes(r.toLowerCase())));
+            if (missingLabels.length > 0) ciStatus = 'label_required';
+            else if (reqReviews > 0 && approvals < reqReviews) ciStatus = 'review_required';
+        }
+
+        return {
+            state: merged ? 'MERGED' : closed ? 'CLOSED' : 'OPEN',
+            merged,
+            closed,
+            ciStatus,
+            jumpUrl: tracker.target || '',
+            tooltip: detail,
+        };
+    }
+
+    // Fetch PR statuses from server tracker list.
+    // Returns the subset of prItems that the server had no data for (needs GitHub scraping fallback).
+    // Returns null if the session changed mid-flight.
+    async function _fetchPrStatusesFromServer(prItems, sessionId, serverUrl) {
+        const base = normalizeServerBaseUrl(serverUrl);
+        let resp;
+        try {
+            resp = await postJsonCrossOrigin(`${base}/rpc`, {
+                jsonrpc: '2.0', id: 1,
+                method: 'trackerList',
+                params: {},
+            });
+        } catch (e) {
+            return prItems; // server unreachable — full fallback
+        }
+        if (resp.error || !resp.result) return prItems;
+        if (sessionId !== activeSessionId) return null;
+
+        const trackers = resp.result.trackers || [];
+        const repoConfigs = resp.result.repo_configs || {};
+
+        const trackerByUrl = new Map();
+        trackers.forEach(t => {
+            const url = (t.target || '').trim().replace(/\/$/, '');
+            trackerByUrl.set(url, t);
+        });
+
+        const needsFallback = [];
+        prItems.forEach(pr => {
+            const url = (pr.url || '').trim().replace(/\/$/, '');
+            const tracker = trackerByUrl.get(url);
+            if (!tracker) { needsFallback.push(pr); return; }
+            const repo = tracker.repo || parseGithubUrl(pr.url)?.repo || '';
+            const repoConfig = repoConfigs[repo] || {};
+            const status = mapTrackerToStatus(tracker, repoConfig);
+            if (!status) { needsFallback.push(pr); return; }
+            Object.assign(pr, status);
+            _trackCiTiming(repo, pr);
+        });
+        return needsFallback;
+    }
+
     async function _fetchPrStatusesBatch(prItems, sessionId) {
-        const work = prItems
+        const repo = parseGithubUrl(window.location.href)?.repo;
+        const cfg = repo ? getRepoConfig(repo) : {};
+        let itemsToFetch = prItems;
+
+        if (cfg.serverUrl) {
+            const fallback = await _fetchPrStatusesFromServer(prItems, sessionId, cfg.serverUrl);
+            if (fallback === null) return; // session changed
+            itemsToFetch = fallback;
+        }
+
+        if (itemsToFetch.length === 0) return;
+
+        const work = itemsToFetch
             .map(pr => ({ pr, parsed: parseGithubUrl(pr.url) }))
             .filter(it => it.parsed);
 
@@ -873,6 +1002,21 @@
             if (sessionId !== activeSessionId) return;
             renderListUI(sessionId);
 
+            // Auto-register backport PRs with the server when configured so it
+            // starts tracking them immediately (status is polled on next tick).
+            const scanCfg = getRepoConfig(currentRepoData.repo);
+            if (scanCfg.serverUrl) {
+                const base = normalizeServerBaseUrl(scanCfg.serverUrl);
+                const targetsText = found.map(pr => pr.url).join('\n');
+                try {
+                    await postJsonCrossOrigin(`${base}/rpc`, {
+                        jsonrpc: '2.0', id: 1,
+                        method: 'trackerAddTargets',
+                        params: { targets_text: targetsText, auto_rerun: true },
+                    });
+                } catch (e) { /* ignore — server may not be running yet */ }
+            }
+
             await _fetchPrStatusesBatch(backportData, sessionId);
             if (sessionId !== activeSessionId) return;
             _primePollingState(currentRepoData.repo);
@@ -935,16 +1079,31 @@
         if (!backportData.some(pr => pr.skipStatusCheck)) {
             const actionBar = document.createElement('div');
             actionBar.className = 'mt-2';
-            actionBar.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:6px;';
 
-            const sendBtn = document.createElement('button');
-            sendBtn.id = 'backport-send-btn';
-            sendBtn.className = "btn btn-sm";
-            sendBtn.style.cssText = "font-size:11px;height:28px;display:inline-flex;align-items:center;justify-content:center;gap:4px;background:var(--color-btn-primary-bg,#1f883d);color:var(--color-btn-primary-text,#fff);border-color:var(--color-btn-primary-border,#1f883d);";
-            sendBtn.innerHTML = `<span>Watch on server</span>`;
-            sendBtn.title = "Send all backport PR URLs to the gh-rerunner server via RPC";
-            sendBtn.onclick = () => sendToServer(sessionId);
-            actionBar.appendChild(sendBtn);
+            const currentRepo = parseGithubUrl(window.location.href)?.repo;
+            const currentCfg = currentRepo ? getRepoConfig(currentRepo) : {};
+            const hasServer = !!currentCfg.serverUrl || _defaultServerAvailable;
+
+            // If no explicit server URL is saved, probe the default address once
+            // per page load so the button appears automatically when the server is running.
+            if (!currentCfg.serverUrl && !_defaultServerProbed) {
+                _probeDefaultServer(sessionId);
+            }
+
+            if (hasServer) {
+                actionBar.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:6px;';
+
+                const sendBtn = document.createElement('button');
+                sendBtn.id = 'backport-send-btn';
+                sendBtn.className = "btn btn-sm";
+                sendBtn.style.cssText = "font-size:11px;height:28px;display:inline-flex;align-items:center;justify-content:center;gap:4px;background:var(--color-btn-primary-bg,#1f883d);color:var(--color-btn-primary-text,#fff);border-color:var(--color-btn-primary-border,#1f883d);";
+                sendBtn.innerHTML = `<span>Watch on server</span>`;
+                sendBtn.title = "Send all backport PR URLs to the gh-rerunner server via RPC";
+                sendBtn.onclick = () => sendToServer(sessionId);
+                actionBar.appendChild(sendBtn);
+            } else {
+                actionBar.style.cssText = 'display:grid;grid-template-columns:1fr;gap:6px;';
+            }
 
             const btn = document.createElement('button');
             btn.className = "btn btn-sm";
@@ -981,6 +1140,12 @@
                 </div>
                 <div style="padding:12px; max-height:420px; overflow-y:auto;">
                     <div class="mb-3">
+                        <div class="text-small text-bold color-fg-muted mb-1">gh-rerunner server URL</div>
+                        <input id="bp-cfg-server-url" type="url" class="form-control input-sm" placeholder="http://127.0.0.1:53210" autocomplete="off" style="width:100%;">
+                        <div class="text-small color-fg-muted mt-1" style="font-size:10px;">When set, statuses and conditions are loaded from the server.</div>
+                    </div>
+                    <hr style="border-color:var(--color-border-muted);margin:0 -12px 8px;">
+                    <div class="mb-3">
                         <div class="text-small text-bold color-fg-muted mb-1">Auto-refresh</div>
                         <select id="bp-cfg-refresh" class="form-select select-sm" style="width:100%;">
                             <option value="0">Off</option>
@@ -1010,8 +1175,6 @@
                             <div class="text-small text-bold color-fg-muted mb-1">Comment scan patterns</div>
                             <div class="text-small color-fg-muted mb-1">One capture group = branch name. Defaults shown — edit to override.</div>
                             <textarea id="bp-cfg-patterns" rows="4" class="form-control input-sm" autocomplete="off" style="${TA_STYLE}"></textarea>
-                            <div class="text-small text-bold color-fg-muted mt-3 mb-1">gh-rerunner server URL</div>
-                            <input id="bp-cfg-server-url" type="url" class="form-control input-sm" placeholder="http://127.0.0.1:53210" autocomplete="off" style="width:100%;">
                         </div>
                     </details>
                 </div>
@@ -1038,23 +1201,44 @@
                 : 'No conditions configured — click to configure';
         }
 
-        function doAutoSave() {
+        async function doAutoSave() {
             const repo = parseGithubUrl(window.location.href)?.repo;
             if (!repo) return;
             const rawPatterns = splitLines('bp-cfg-patterns');
             // If the textarea still matches the built-in defaults exactly, store empty (so built-ins remain active)
             const isDefaultPatterns = rawPatterns.length === BUILTIN_PATTERN_STRS.length &&
                 rawPatterns.every((p, i) => p === BUILTIN_PATTERN_STRS[i]);
+            const serverUrl = (document.getElementById('bp-cfg-server-url').value || '').trim();
+            const excludeCiJobs = splitLines('bp-cfg-exclude-jobs');
+            const requiredLabels = splitLines('bp-cfg-labels');
+            const requiredReviews = parseInt(document.getElementById('bp-cfg-reviews').value, 10) || 0;
             saveRepoConfig(repo, {
-                excludeCiJobs: splitLines('bp-cfg-exclude-jobs'),
-                requiredLabels: splitLines('bp-cfg-labels'),
-                requiredReviews: parseInt(document.getElementById('bp-cfg-reviews').value, 10) || 0,
+                excludeCiJobs,
+                requiredLabels,
+                requiredReviews,
                 commentPatterns: isDefaultPatterns ? [] : rawPatterns,
                 refreshInterval: parseInt(document.getElementById('bp-cfg-refresh').value, 10) || 0,
-                serverUrl: (document.getElementById('bp-cfg-server-url').value || '').trim(),
+                serverUrl,
             });
             updateSettingsBtnTitle(repo);
             startAutoRefresh(repo);
+
+            // Sync merge-condition config to server when configured.
+            if (serverUrl) {
+                const base = normalizeServerBaseUrl(serverUrl);
+                try {
+                    await postJsonCrossOrigin(`${base}/rpc`, {
+                        jsonrpc: '2.0', id: 1,
+                        method: 'repoConfigSet',
+                        params: {
+                            repo,
+                            ignore_jobs: excludeCiJobs,
+                            required_reviews: requiredReviews,
+                            required_labels: requiredLabels,
+                        },
+                    });
+                } catch (e) { /* ignore */ }
+            }
         }
 
         function closePanel() {
@@ -1066,19 +1250,37 @@
             if (!settingsPanel.contains(e.target) && !settingsBtn.contains(e.target)) closePanel();
         }
 
-        function openPanel() {
+        async function openPanel() {
             const repo = parseGithubUrl(window.location.href)?.repo;
             if (repo) {
                 const cfg = getRepoConfig(repo);
+                document.getElementById('bp-cfg-server-url').value = cfg.serverUrl || '';
                 document.getElementById('bp-cfg-refresh').value = String(cfg.refreshInterval ?? 30000);
-                document.getElementById('bp-cfg-exclude-jobs').value = cfg.excludeCiJobs.join('\n');
-                document.getElementById('bp-cfg-labels').value = cfg.requiredLabels.join('\n');
-                document.getElementById('bp-cfg-reviews').value = cfg.requiredReviews || '';
+
+                // Try to load merge-condition config from the server when configured.
+                let serverCfg = null;
+                if (cfg.serverUrl) {
+                    try {
+                        const base = normalizeServerBaseUrl(cfg.serverUrl);
+                        const resp = await postJsonCrossOrigin(`${base}/rpc`, {
+                            jsonrpc: '2.0', id: 1,
+                            method: 'repoConfigGet',
+                            params: { repo },
+                        });
+                        if (!resp.error && resp.result) serverCfg = resp.result;
+                    } catch (e) { /* server unreachable — use local values */ }
+                }
+
+                document.getElementById('bp-cfg-exclude-jobs').value =
+                    (serverCfg ? (serverCfg.ignore_jobs || []) : cfg.excludeCiJobs).join('\n');
+                document.getElementById('bp-cfg-labels').value =
+                    (serverCfg ? (serverCfg.required_labels || []) : cfg.requiredLabels).join('\n');
+                document.getElementById('bp-cfg-reviews').value =
+                    serverCfg != null ? (serverCfg.required_reviews || '') : (cfg.requiredReviews || '');
                 // Pre-populate patterns with built-in defaults when no custom patterns saved
                 document.getElementById('bp-cfg-patterns').value = cfg.commentPatterns.length
                     ? cfg.commentPatterns.join('\n')
                     : BUILTIN_PATTERN_STRS.join('\n');
-                document.getElementById('bp-cfg-server-url').value = cfg.serverUrl || '';
             }
             settingsPanel.style.display = 'block';
             setTimeout(() => document.addEventListener('click', outsideClickHandler), 0);
@@ -1112,6 +1314,8 @@
         activeSessionId += 1;
         backportData = [];
         isScanning = false;
+        _defaultServerAvailable = false;
+        _defaultServerProbed = false;
         if (refreshIntervalId) { clearTimeout(refreshIntervalId); refreshIntervalId = null; }
         const oldWidget = document.getElementById('backport-tracker-section');
         if (oldWidget) oldWidget.remove();
