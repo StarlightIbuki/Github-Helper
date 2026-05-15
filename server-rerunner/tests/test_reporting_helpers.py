@@ -134,6 +134,32 @@ def test_pr_status_cache_round_trip():
         "detail": "CI failed",
         "title": "Fix flaky test",
         "source_pr": 0,
+        "backport_target": "",
+    }
+
+
+def test_pr_status_cache_round_trip_preserves_backport_target():
+    cache = {"prs": {}}
+
+    _set_cached_pr_status(
+        cache,
+        repo_name="org/repo",
+        pr_number=456,
+        branch="mergify/bp/release-3.11/pr-99",
+        detail="CI failed",
+        title="chore(backport): fix race",
+        source_pr=99,
+        backport_target="release-3.11",
+    )
+
+    cached = _get_cached_pr_status(cache, "org/repo", 456, ttl_seconds=99999)
+
+    assert cached == {
+        "branch": "mergify/bp/release-3.11/pr-99",
+        "detail": "CI failed",
+        "title": "chore(backport): fix race",
+        "source_pr": 99,
+        "backport_target": "release-3.11",
     }
 
 
@@ -167,6 +193,16 @@ def test_build_pr_display_meta_marks_backport_and_branch():
     assert meta["pr_title"] == "add fix"
     assert meta["is_backport"] is True
     assert meta["backport_target"] == "release/3.1.x"
+
+
+def test_build_pr_display_meta_keeps_unknown_target_without_branch_hints():
+    meta = _build_pr_display_meta(
+        "chore(backport): add fix",
+        "feature/random",
+    )
+
+    assert meta["is_backport"] is True
+    assert meta["backport_target"] == ""
 
 
 def test_extract_backport_target_branch_bp_ref():

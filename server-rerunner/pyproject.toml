@@ -13,6 +13,7 @@ dependencies = [
     "PyGithub>=2.0",
     "click>=8.0",
     "rich>=13.0",
+    "aiohttp>=3.8",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +24,13 @@ gh-rerunner = "gh_rerunner.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gh_rerunner"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/gh_rerunner/web/pages/index.html" = "gh_rerunner/web/pages/index.html"
+"src/gh_rerunner/web/pages/auth.html" = "gh_rerunner/web/pages/auth.html"
+"src/gh_rerunner/web/pages/add-targets.html" = "gh_rerunner/web/pages/add-targets.html"
+"src/gh_rerunner/web/static/common.css" = "gh_rerunner/web/static/common.css"
+"src/gh_rerunner/web/static/common.js" = "gh_rerunner/web/static/common.js"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
