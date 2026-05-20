@@ -1226,11 +1226,23 @@
             }
         }, true);
 
+        function syncRepoCheckbox(repo) {
+            const cb = document.querySelector(`.repo-select-all[data-repo="${CSS.escape(repo)}"]`);
+            if (!cb) return;
+            const list = trackerRows.filter(t => (t.repo || 'Unknown') === repo);
+            const selCount = list.filter(t => selectedTrackers.has(t.id)).length;
+            if (selCount === 0) { cb.checked = false; cb.indeterminate = false; }
+            else if (selCount === list.length) { cb.checked = true; cb.indeterminate = false; }
+            else { cb.checked = false; cb.indeterminate = true; }
+        }
+
         window.toggleTrackerSelection = function(id, checked) {
             if (checked) selectedTrackers.add(id);
             else selectedTrackers.delete(id);
             const card = document.getElementById(`pr-card-${id}`);
             if (card) card.classList.toggle('pr-card-selected', checked);
+            const tracker = trackerRows.find(t => t.id == id);
+            if (tracker) syncRepoCheckbox(tracker.repo || 'Unknown');
             renderBulkBar();
         };
 
@@ -1246,6 +1258,9 @@
                     if (cb) cb.checked = checked;
                 }
             });
+            // clear indeterminate state on the repo checkbox
+            const repoCb = document.querySelector(`.repo-select-all[data-repo="${CSS.escape(repo)}"]`);
+            if (repoCb) repoCb.indeterminate = false;
             renderBulkBar();
         };
 
@@ -1268,7 +1283,7 @@
                 }
             });
             // also uncheck repo-level checkboxes
-            document.querySelectorAll('.repo-select-all').forEach(cb => { cb.checked = false; });
+            document.querySelectorAll('.repo-select-all').forEach(cb => { cb.checked = false; cb.indeterminate = false; });
             selectedTrackers.clear();
             const retryPanel = document.getElementById('bulk-retry-panel');
             if (retryPanel) retryPanel.hidden = true;
@@ -1450,7 +1465,7 @@
                 <div class="repo-card">
                     <div class="repo-header">
                         <span style="display:flex;align-items:center;gap:8px;">
-                            <input type="checkbox" class="repo-select-all" title="Select all PRs in this repository" onclick="event.stopPropagation()" onchange="toggleRepoSelection(${JSON.stringify(repo)}, this.checked)">
+                            <input type="checkbox" class="repo-select-all" data-repo="${escapeHtml(repo)}" title="Select all PRs in this repository" onclick="event.stopPropagation()" onchange="toggleRepoSelection(${JSON.stringify(repo)}, this.checked)">
                             <span>${escapeHtml(repo)}</span>
                         </span>
                         <span style="display:flex;align-items:center;gap:10px;">
