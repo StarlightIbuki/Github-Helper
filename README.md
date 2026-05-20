@@ -1,6 +1,8 @@
 # GitHub Helper
 
-A toolkit for tracking and managing backport PRs and CI reruns on GitHub. 
+A toolkit for tracking and managing backport PRs and CI reruns on GitHub.
+
+This is a vibe coding product. Use at your own risk.
 
 ## Quick Start
 
