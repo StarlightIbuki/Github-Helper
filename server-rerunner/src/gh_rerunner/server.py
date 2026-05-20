@@ -34,6 +34,7 @@ from gh_rerunner.cli import (
     _resolve_session_ref,
     _request_device_code as _cli_request_device_code,
     _poll_device_token as _cli_poll_device_token,
+    _trigger_rerun,
     _URL_RE,
     _RETRY_CONCLUSIONS,
     _DONE_CONCLUSIONS,
@@ -876,7 +877,7 @@ class JSONRPCServer:
                 for failed_run in failed_runs_to_retry:
                     run_name = str(getattr(failed_run, "name", "") or "").strip().lower()
                     try:
-                        failed_run.rerun()
+                        rerun_mode = _trigger_rerun(failed_run)
                     except Exception as exc:
                         self._record_event(
                             f"#{pr_number} {repo_name} rerun error for "
@@ -886,7 +887,7 @@ class JSONRPCServer:
                     run_attempts[run_name] = run_attempts.get(run_name, 0) + 1
                     self._record_event(
                         f"#{pr_number} {repo_name} rerunning {getattr(failed_run, 'name', '')} "
-                        f"({run_attempts[run_name]}/{attempts_total})"
+                        f"({run_attempts[run_name]}/{attempts_total}) [{rerun_mode}]"
                     )
                     rerun_job_entries.append({
                         "id": int(getattr(failed_run, "id", 0) or 0),
