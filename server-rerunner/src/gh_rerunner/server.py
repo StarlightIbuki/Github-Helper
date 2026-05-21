@@ -92,6 +92,25 @@ _PR_URL_RE = re.compile(
     r"https://github\.com/(?P<repo>[^/\s]+/[^/\s]+)/pull/(?P<num>\d+)"
 )
 
+
+def _normalize_target_url(target: str) -> str:
+    """Lowercase the owner/repo segment of a GitHub PR URL.
+
+    GitHub treats owner/repo as case-insensitive, so two trackers added for
+    e.g. `Kong/kong-ee#123` and `kong/kong-ee#123` should canonicalize to the
+    same target. This keeps storage and grouping consistent regardless of the
+    user's input casing.
+    """
+    text = str(target or "").strip()
+    if not text:
+        return text
+    match = _PR_URL_RE.search(text)
+    if not match:
+        return text
+    canonical_repo = match.group("repo").lower()
+    start, end = match.span("repo")
+    return text[:start] + canonical_repo + text[end:]
+
 _GITHUB_OAUTH_TOKEN_URL = "https://github.com/login/oauth/access_token"
 _DEFAULT_GITHUB_CLIENT_ID = "Ov23lio3O4l5m3CE589o"
 _GITHUB_CLIENT_ID_ENV_NAMES = ("GH_RERUNNER_GITHUB_CLIENT_ID", "GH_RERUNNER_OAUTH_CLIENT_ID")
@@ -314,11 +333,15 @@ class JSONRPCServer:
         pr_number: int,
         ttl_seconds: Optional[int] = 3600,
     ) -> Optional[dict[str, Any]]:
-        key = f"{repo_name}#{pr_number}"
         prs = self._cache.get("prs", {})
         if not isinstance(prs, dict):
             return None
-        raw = prs.get(key)
+        # Owner/repo on GitHub is case-insensitive; match cache keys the same way.
+        key_lower = f"{repo_name}#{pr_number}".lower()
+        raw = next(
+            (v for k, v in prs.items() if isinstance(k, str) and k.lower() == key_lower),
+            None,
+        )
         if not isinstance(raw, dict):
             return None
 
@@ -364,7 +387,10 @@ class JSONRPCServer:
         if not backport_target:
             backport_target = _normalize_backport_target(cached.get("backport_target", ""))
 
-        tracker["repo"] = repo_name
+        # Preserve any canonical-cased repo previously written by _update_tracker;
+        # the URL-extracted value here is always lowercase after URL normalization.
+        if not str(tracker.get("repo", "") or ""):
+            tracker["repo"] = repo_name
         tracker["pr_number"] = pr_number
         tracker["last_detail"] = detail or "unknown"
         tracker["last_error"] = ""
@@ -432,7 +458,7 @@ class JSONRPCServer:
         auto_rerun: bool = True,
         ignore_jobs: Optional[list[str]] = None,
     ) -> dict[str, Any]:
-        target = str(target or "").strip()
+        target = _normalize_target_url(str(target or "").strip())
         if not target:
             raise ValueError("target is required")
         if not _PR_URL_RE.search(target):
@@ -440,7 +466,7 @@ class JSONRPCServer:
         ignore = [str(x).strip() for x in (ignore_jobs or []) if str(x).strip()]
         with self._tracker_lock:
             for existing in self._trackers:
-                if str(existing.get("target", "")).strip() == target:
+                if _normalize_target_url(str(existing.get("target", "")).strip()) == target:
                     return copy.deepcopy(existing)
             next_id = max((int(t.get("id", 0) or 0) for t in self._trackers), default=0) + 1
             tracker = {
@@ -519,7 +545,7 @@ class JSONRPCServer:
                 if not isinstance(raw, dict):
                     continue
                 tracker_id = int(raw.get("id", 0) or 0)
-                target = str(raw.get("target", "")).strip()
+                target = _normalize_target_url(str(raw.get("target", "")).strip())
                 if tracker_id <= 0 or not target:
                     continue
                 raw_jobs = raw.get("jobs", []) if isinstance(raw.get("jobs", []), list) else []
@@ -580,7 +606,17 @@ class JSONRPCServer:
                         if str(x).strip()
                     ],
                 })
-            return normalized
+            # Drop duplicates introduced by case-different target URLs that
+            # predate URL canonicalization. Keep the most recently updated.
+            by_target: dict[str, dict[str, Any]] = {}
+            for tracker in normalized:
+                key = str(tracker.get("target", "")).strip()
+                existing = by_target.get(key)
+                if existing is None or float(tracker.get("last_updated", 0) or 0) > float(
+                    existing.get("last_updated", 0) or 0
+                ):
+                    by_target[key] = tracker
+            return list(by_target.values())
         except Exception as exc:
             logger.error("Failed to load trackers: %s", exc)
             return []
@@ -706,7 +742,11 @@ class JSONRPCServer:
         if match:
             repo_name = match.group("repo")
             pr_number = int(match.group("num"))
-            tracker["repo"] = repo_name
+            # Don't clobber a canonical-cased repo (from a prior API call) with
+            # the lowercase URL value — that produces a visible "bounce" between
+            # refreshes when polling lands between the two writes below.
+            if not str(tracker.get("repo", "") or ""):
+                tracker["repo"] = repo_name
             tracker["pr_number"] = pr_number
         else:
             repo_name = ""
@@ -734,6 +774,11 @@ class JSONRPCServer:
             return True
         try:
             repo = self._gh.get_repo(repo_name)
+            # GitHub treats owner/repo case-insensitively; adopt the canonical
+            # full_name so trackers added under different casings group together.
+            canonical_repo = str(getattr(repo, "full_name", "") or repo_name) or repo_name
+            if canonical_repo and canonical_repo != repo_name:
+                repo_name = canonical_repo
             pr = repo.get_pull(pr_number)
             body = str(getattr(pr, "body", "") or "")
             title = str(getattr(pr, "title", "") or "")
@@ -777,6 +822,24 @@ class JSONRPCServer:
                 runs = list(repo.get_workflow_runs(head_sha=pr.head.sha))
             except Exception:
                 runs = []
+
+            # A single workflow file can produce multiple runs for the same SHA
+            # (e.g. when triggered by both `push` and `pull_request`). Keep only
+            # the most recent run per workflow so the rerunner doesn't act on
+            # stale duplicates and the UI doesn't render the same job twice.
+            # `get_workflow_runs` returns runs newest-first, so the first
+            # occurrence of each key wins.
+            deduped_runs: list[Any] = []
+            seen_run_keys: set[Any] = set()
+            for run in runs:
+                key = getattr(run, "workflow_id", None) or str(
+                    getattr(run, "name", "") or ""
+                ).strip().lower()
+                if not key or key in seen_run_keys:
+                    continue
+                seen_run_keys.add(key)
+                deduped_runs.append(run)
+            runs = deduped_runs
 
             prev_jobs = {int(j.get("id", 0) or 0): j for j in (tracker.get("jobs") or [])}
             new_jobs: list[dict[str, Any]] = []
@@ -1268,7 +1331,7 @@ class JSONRPCServer:
         auto_rerun: bool = True,
         ignore_jobs: Optional[list[str]] = None,
     ) -> dict[str, Any]:
-        target = str(target or "").strip()
+        target = _normalize_target_url(str(target or "").strip())
         if not target:
             raise JSONRPCError(self.INVALID_PARAMS, "target is required")
         if not _PR_URL_RE.search(target):
@@ -1282,7 +1345,7 @@ class JSONRPCServer:
 
         with self._tracker_lock:
             for existing in self._trackers:
-                if str(existing.get("target", "")).strip() == target:
+                if _normalize_target_url(str(existing.get("target", "")).strip()) == target:
                     return {"tracker": dict(existing), "exists": True}
 
             next_id = max((int(t.get("id", 0) or 0) for t in self._trackers), default=0) + 1

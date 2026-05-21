@@ -1251,16 +1251,8 @@
             list.forEach(t => {
                 if (checked) selectedTrackers.add(t.id);
                 else selectedTrackers.delete(t.id);
-                const card = document.getElementById(`pr-card-${t.id}`);
-                if (card) {
-                    card.classList.toggle('pr-card-selected', checked);
-                    const cb = card.querySelector('.pr-select-cb');
-                    if (cb) cb.checked = checked;
-                }
             });
-            // clear indeterminate state on the repo checkbox
-            const repoCb = document.querySelector(`.repo-select-all[data-repo="${CSS.escape(repo)}"]`);
-            if (repoCb) repoCb.indeterminate = false;
+            renderTrackersTree(trackerRows);
             renderBulkBar();
         };
 
@@ -1461,11 +1453,15 @@
 
             const validGroupIds = new Set();
 
-            trackerTreeEl.innerHTML = [...byRepo.entries()].map(([repo, list]) => `
+            trackerTreeEl.innerHTML = [...byRepo.entries()].map(([repo, list]) => {
+                const selCount = list.filter(t => selectedTrackers.has(t.id)).length;
+                const repoAllSelected = selCount > 0 && selCount === list.length;
+                const repoIndeterminate = selCount > 0 && selCount < list.length;
+                return `
                 <div class="repo-card">
                     <div class="repo-header">
                         <span style="display:flex;align-items:center;gap:8px;">
-                            <input type="checkbox" class="repo-select-all" data-repo="${escapeHtml(repo)}" title="Select all PRs in this repository" onclick="event.stopPropagation()" onchange="toggleRepoSelection(${JSON.stringify(repo)}, this.checked)">
+                            <input type="checkbox" class="repo-select-all" data-repo="${escapeHtml(repo)}" title="Select all PRs in this repository"${repoAllSelected ? ' checked' : ''}${repoIndeterminate ? ' data-indeterminate="1"' : ''} onclick="event.stopPropagation()" onchange="toggleRepoSelection(this.dataset.repo, this.checked)">
                             <span>${escapeHtml(repo)}</span>
                         </span>
                         <span style="display:flex;align-items:center;gap:10px;">
@@ -1527,7 +1523,13 @@
                         }).join('');
                     })()}
                 </div>
-            `).join('');
+            `;
+            }).join('');
+
+            // <input> doesn't accept `indeterminate` as an HTML attribute — set it imperatively.
+            trackerTreeEl.querySelectorAll('.repo-select-all[data-indeterminate="1"]').forEach(cb => {
+                cb.indeterminate = true;
+            });
 
             [...expandedBackportGroups].forEach((groupId) => {
                 if (!validGroupIds.has(groupId)) expandedBackportGroups.delete(groupId);
