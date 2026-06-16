@@ -18,7 +18,7 @@ The headless GitHub Actions auto-rerunner has moved to its own repository:
 **→ https://github.com/StarlightIbuki/GHelper**
 
 ```bash
-pipx install "gh-rerunner @ git+https://github.com/StarlightIbuki/GHelper.git"
+pipx install "ghelper @ git+https://github.com/StarlightIbuki/GHelper.git"
 ```
 
 See that repository's README for installation, authentication, and the full CLI
