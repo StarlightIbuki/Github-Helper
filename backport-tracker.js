@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Backport Tracker
 // @namespace    https://github.com/StarlightIbuki
-// @version      1.7
+// @version      1.8
 // @description  Track backport PRs
 // @match        https://github.com/*
 // @connect      github.com
@@ -38,6 +38,14 @@
     const CI_MIN_REFRESH_MS = 15000;
     const CI_MAX_REFRESH_MS = 10 * 60 * 1000;
     const CI_BATCH_CONCURRENCY = 4;
+
+    // Migration notice: this userscript is moving to a new, separately-maintained home.
+    // We intentionally do NOT auto-update (@updateURL) — the new script is still catching
+    // up on features, so the switch should be a deliberate, user-confirmed action.
+    // Bump MIGRATION_NOTICE_VERSION to re-show the banner to users who already dismissed it.
+    const NEW_SCRIPT_URL = 'https://github.com/houmkh/tampermonkey-backport-tracker';
+    const MIGRATION_NOTICE_KEY = 'bp_tracker_migration_notice_dismissed';
+    const MIGRATION_NOTICE_VERSION = '1';
 
     const OCTICONS = {
         check: '<svg class="octicon octicon-check color-fg-success" viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0Z"></path></svg>',
@@ -1126,6 +1134,8 @@
 
         const TA_STYLE = 'width:100%;box-sizing:border-box;resize:vertical;font-size:11px;';
 
+        const migrationDismissed = GM_getValue(MIGRATION_NOTICE_KEY, '') === MIGRATION_NOTICE_VERSION;
+
         section.innerHTML = `
             <div class="discussion-sidebar-heading text-bold mb-2 d-flex flex-justify-between flex-items-center" style="font-size: 12px;">
                 <span>${OCTICONS.branch} <span class="ml-1" id="backport-title">Backports</span></span>
@@ -1133,6 +1143,15 @@
                     <button id="backport-refresh-btn" class="btn-link color-fg-muted" type="button" title="Refresh statuses">${OCTICONS.sync}</button>
                     <button id="backport-settings-btn" class="btn-link color-fg-muted" type="button">${OCTICONS.gear}</button>
                 </div>
+            </div>
+            <div id="backport-migration-notice" class="flash flash-warn mb-2 p-2" style="display:${migrationDismissed ? 'none' : 'flex'}; gap:6px; align-items:flex-start; font-size:11px; line-height:1.4;">
+                <span style="flex-shrink:0; margin-top:1px;">${OCTICONS.alert}</span>
+                <div style="flex:1;">
+                    <span class="text-bold">Backport Tracker has a new home.</span>
+                    This script is moving to <a href="${NEW_SCRIPT_URL}" target="_blank" rel="noopener noreferrer">houmkh/tampermonkey-backport-tracker</a>.
+                    Some features are still being ported, so switch when you're ready — this copy won't auto-update.
+                </div>
+                <button id="backport-migration-dismiss" class="btn-link color-fg-muted" type="button" title="Dismiss — don't show this again" style="flex-shrink:0;">${OCTICONS.x}</button>
             </div>
             <div id="backport-settings-panel" class="select-menu-modal position-absolute right-0" role="dialog" style="display:none; z-index:99; width:260px; top:28px; overflow:visible;">
                 <div class="select-menu-header rounded-top-2">
@@ -1184,6 +1203,15 @@
 
         sidebar.prepend(section);
         document.getElementById('backport-refresh-btn').addEventListener('click', () => triggerRefresh(activeSessionId));
+
+        const migrationDismissBtn = document.getElementById('backport-migration-dismiss');
+        if (migrationDismissBtn) {
+            migrationDismissBtn.addEventListener('click', () => {
+                GM_setValue(MIGRATION_NOTICE_KEY, MIGRATION_NOTICE_VERSION);
+                const notice = document.getElementById('backport-migration-notice');
+                if (notice) notice.style.display = 'none';
+            });
+        }
 
         const settingsBtn = document.getElementById('backport-settings-btn');
         const settingsPanel = document.getElementById('backport-settings-panel');
